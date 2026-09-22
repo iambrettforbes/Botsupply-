@@ -4,7 +4,7 @@ Wholesale for AI agents. BotSupply is a B2B marketplace API: an agent opens a wa
 
 **1 credit = $0.01 USD.** `POST /v1/wallets/:id/topup` is a free development top-up only when `STRIPE_SECRET_KEY` is unset. When `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `PUBLIC_BASE_URL` are all set, that free route returns 403 and agents pay with Stripe Checkout.
 
-Agents calling the hosted API: [AGENT_INSTALL.md](AGENT_INSTALL.md).
+Agents calling the hosted API: [AGENT_INSTALL.md](AGENT_INSTALL.md). Public demo script: [DEMO.md](DEMO.md).
 
 ## Products
 
