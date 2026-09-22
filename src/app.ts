@@ -1,6 +1,8 @@
+import { Readable } from "node:stream";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import { catalogDocument, findProduct } from "./catalog.js";
 import {
+  applyStripeCheckoutCredit,
   createWallet,
   findPurchase,
   findWalletByApiKey,
@@ -12,10 +14,20 @@ import {
 } from "./db.js";
 import { ApiError } from "./errors.js";
 import { renderLanding } from "./landing.js";
+import {
+  CHECKOUT_MAX_CREDITS,
+  CHECKOUT_MIN_CREDITS,
+  checkoutUrls,
+  stripeFromEnv,
+  type CheckoutCompletedEvent,
+  type ResolvedStripe,
+} from "./stripe.js";
 
 export type BuildOptions = {
   sqlitePath: string;
   logger?: boolean;
+  /** Omit to read Stripe settings from the environment. */
+  stripe?: ResolvedStripe;
 };
 
 const MAX_TOPUP = 1_000_000;
@@ -43,10 +55,10 @@ function readLabel(body: Record<string, unknown>): string | null {
   return body.label.trim();
 }
 
-function readCredits(body: Record<string, unknown>): number {
+function readCredits(body: Record<string, unknown>, min: number, max: number): number {
   const credits = body.credits;
-  if (typeof credits !== "number" || !Number.isInteger(credits) || credits < 1 || credits > MAX_TOPUP) {
-    throw new ApiError(400, "bad_request", `credits must be an integer from 1 to ${MAX_TOPUP}`);
+  if (typeof credits !== "number" || !Number.isInteger(credits) || credits < min || credits > max) {
+    throw new ApiError(400, "bad_request", `credits must be an integer from ${min} to ${max}`);
   }
   return credits;
 }
@@ -89,12 +101,56 @@ function publicPurchase(
   };
 }
 
+const rawBodies = new WeakMap<FastifyRequest, Buffer>();
+
+function headerValue(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) return value[0] ?? "";
+  return value ?? "";
+}
+
+function sessionFromEvent(event: CheckoutCompletedEvent): {
+  sessionId: string;
+  walletId: string;
+  credits: number;
+  paymentStatus: string;
+} {
+  const session = event.data?.object;
+  const sessionId = session?.id ?? "";
+  const walletId = session?.metadata?.wallet_id ?? "";
+  const credits = Number(session?.metadata?.credits);
+  if (!sessionId || !walletId || !Number.isInteger(credits)) {
+    throw new ApiError(400, "invalid_session", "Checkout session is missing wallet_id or credits metadata");
+  }
+  if (credits < CHECKOUT_MIN_CREDITS || credits > CHECKOUT_MAX_CREDITS) {
+    throw new ApiError(400, "invalid_session", "Checkout session credits are outside the allowed range");
+  }
+  return {
+    sessionId,
+    walletId,
+    credits,
+    paymentStatus: session?.payment_status ?? "",
+  };
+}
+
 export async function buildApp(options: BuildOptions): Promise<FastifyInstance> {
   const app = Fastify({ logger: options.logger ?? false });
   const db = openDatabase(options.sqlitePath);
+  const stripe = options.stripe ?? stripeFromEnv();
 
   app.addHook("onClose", async () => {
     db.close();
+  });
+
+  app.addHook("preParsing", async (request, _reply, payload) => {
+    const path = request.url.split("?")[0];
+    if (request.method !== "POST" || path !== "/v1/stripe/webhook") return payload;
+    const chunks: Buffer[] = [];
+    for await (const chunk of payload) {
+      chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+    }
+    const raw = Buffer.concat(chunks);
+    rawBodies.set(request, raw);
+    return Readable.from(raw);
   });
 
   app.setErrorHandler((error, request, reply) => {
@@ -135,10 +191,17 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
   });
 
   app.post("/v1/wallets/:id/topup", async (request, reply) => {
+    if (!stripe.devTopupEnabled) {
+      throw new ApiError(
+        403,
+        "dev_topup_disabled",
+        "Development top-up is available only when STRIPE_SECRET_KEY is unset. Use POST /v1/wallets/:id/checkout.",
+      );
+    }
     const { id } = request.params as { id: string };
     const body = asRecord(request.body);
     rejectUnknown(body, ["credits"]);
-    const credits = readCredits(body);
+    const credits = readCredits(body, 1, MAX_TOPUP);
     const wallet = topUpWallet(db, id, credits);
     if (!wallet) {
       throw new ApiError(404, "not_found", "Wallet not found");
@@ -147,7 +210,93 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
       wallet_id: wallet.id,
       credited: credits,
       balance_credits: wallet.balance_credits,
-      note: "Development top-up. No payment was collected.",
+      note: "Development top-up. No payment was collected. This route is disabled once STRIPE_SECRET_KEY is set.",
+    });
+  });
+
+  app.post("/v1/wallets/:id/checkout", async (request, reply) => {
+    if (!stripe.ready) {
+      const missing = stripe.devTopupEnabled
+        ? ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "PUBLIC_BASE_URL"]
+        : stripe.missing;
+      throw new ApiError(
+        503,
+        "stripe_not_configured",
+        `Stripe checkout is not configured. Set ${missing.join(", ")}.`,
+      );
+    }
+    const wallet = bearerWallet(db, request);
+    const { id } = request.params as { id: string };
+    if (wallet.id !== id) {
+      throw new ApiError(403, "forbidden", "API key does not match this wallet");
+    }
+    const body = asRecord(request.body);
+    rejectUnknown(body, ["credits"]);
+    const credits = readCredits(body, CHECKOUT_MIN_CREDITS, CHECKOUT_MAX_CREDITS);
+    const urls = checkoutUrls(stripe.ready.publicBaseUrl);
+    let session: { id: string; url: string | null };
+    try {
+      session = await stripe.ready.gateway.createCheckoutSession({
+        walletId: wallet.id,
+        credits,
+        successUrl: urls.successUrl,
+        cancelUrl: urls.cancelUrl,
+      });
+    } catch (error) {
+      request.log.error(error);
+      throw new ApiError(502, "stripe_error", "Stripe could not create a Checkout Session");
+    }
+    if (!session.url) {
+      throw new ApiError(502, "stripe_error", "Stripe did not return a Checkout URL");
+    }
+    return reply.status(201).send({
+      checkout_session_id: session.id,
+      url: session.url,
+      wallet_id: wallet.id,
+      credits,
+      amount_cents: credits,
+      currency: "usd",
+    });
+  });
+
+  app.post("/v1/stripe/webhook", async (request, reply) => {
+    if (!stripe.ready) {
+      throw new ApiError(503, "stripe_not_configured", "Stripe webhook is not configured");
+    }
+    const signature = headerValue(request.headers["stripe-signature"]);
+    const raw = rawBodies.get(request);
+    if (!signature || !raw) {
+      throw new ApiError(400, "invalid_signature", "Missing Stripe signature or body");
+    }
+    let event: CheckoutCompletedEvent;
+    try {
+      event = stripe.ready.gateway.constructEvent(raw, signature);
+    } catch (error) {
+      request.log.error(error);
+      throw new ApiError(400, "invalid_signature", "Invalid Stripe signature");
+    }
+    if (event.type !== "checkout.session.completed") {
+      return reply.send({ received: true, credited: false });
+    }
+    const session = sessionFromEvent(event);
+    if (session.paymentStatus !== "paid") {
+      return reply.send({ received: true, credited: false });
+    }
+    const result = applyStripeCheckoutCredit(db, {
+      sessionId: session.sessionId,
+      walletId: session.walletId,
+      credits: session.credits,
+    });
+    if (!result.ok) {
+      throw new ApiError(404, "not_found", "Wallet not found");
+    }
+    return reply.send({
+      received: true,
+      credited: result.applied,
+      wallet_id: result.wallet_id,
+      credits: result.credits,
+      balance_credits: result.balance_credits,
+      checkout_session_id: result.session_id,
     });
   });
 

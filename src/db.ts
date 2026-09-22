@@ -46,6 +46,12 @@ export function openDatabase(sqlitePath: string): Database.Database {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_purchases_wallet ON purchases(wallet_id);
+    CREATE TABLE IF NOT EXISTS stripe_checkout_credits (
+      session_id TEXT PRIMARY KEY,
+      wallet_id TEXT NOT NULL REFERENCES wallets(id),
+      credits INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
   `);
   return db;
 }
@@ -130,4 +136,61 @@ export function purchaseSku(
 
 export function findPurchase(db: Database.Database, id: string): PurchaseRow | undefined {
   return db.prepare("SELECT * FROM purchases WHERE id = ?").get(id) as PurchaseRow | undefined;
+}
+
+export type ApplyStripeCreditResult =
+  | {
+      ok: true;
+      applied: boolean;
+      balance_credits: number;
+      wallet_id: string;
+      credits: number;
+      session_id: string;
+    }
+  | { ok: false; code: "wallet_not_found" | "invalid_credit" };
+
+/**
+ * Credits a wallet for a paid Checkout Session. The session id is the idempotency key:
+ * a second call with the same id does not add credits again.
+ */
+export function applyStripeCheckoutCredit(
+  db: Database.Database,
+  input: { sessionId: string; walletId: string; credits: number },
+): ApplyStripeCreditResult {
+  if (!input.sessionId || !Number.isInteger(input.credits) || input.credits < 1) {
+    return { ok: false, code: "invalid_credit" };
+  }
+  const run = db.transaction((): ApplyStripeCreditResult => {
+    const existing = db
+      .prepare("SELECT session_id, wallet_id, credits FROM stripe_checkout_credits WHERE session_id = ?")
+      .get(input.sessionId) as { session_id: string; wallet_id: string; credits: number } | undefined;
+    if (existing) {
+      const wallet = findWalletById(db, existing.wallet_id);
+      return {
+        ok: true,
+        applied: false,
+        balance_credits: wallet?.balance_credits ?? 0,
+        wallet_id: existing.wallet_id,
+        credits: existing.credits,
+        session_id: existing.session_id,
+      };
+    }
+    const wallet = findWalletById(db, input.walletId);
+    if (!wallet) return { ok: false, code: "wallet_not_found" };
+    db.prepare(
+      `INSERT INTO stripe_checkout_credits (session_id, wallet_id, credits, created_at)
+       VALUES (?, ?, ?, ?)`,
+    ).run(input.sessionId, input.walletId, input.credits, new Date().toISOString());
+    const updated = topUpWallet(db, input.walletId, input.credits);
+    if (!updated) return { ok: false, code: "wallet_not_found" };
+    return {
+      ok: true,
+      applied: true,
+      balance_credits: updated.balance_credits,
+      wallet_id: updated.id,
+      credits: input.credits,
+      session_id: input.sessionId,
+    };
+  });
+  return run();
 }

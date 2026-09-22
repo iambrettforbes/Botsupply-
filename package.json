@@ -12,11 +12,12 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
-    "test": "tsc -p tsconfig.test.json && node --import tsx --test tests/api.test.ts"
+    "test": "tsc -p tsconfig.test.json && node --import tsx --test tests/api.test.ts tests/stripe.test.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.10.0",
-    "fastify": "^5.6.1"
+    "fastify": "^5.6.1",
+    "stripe": "^22.6.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

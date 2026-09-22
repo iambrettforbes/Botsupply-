@@ -131,7 +131,8 @@ export function renderLanding(): string {
     .sku h3 { margin: 18px 0 6px; font-size: 18px; font-weight: 500; }
     .sku code, pre code { color: var(--ink); }
     .sku code { display: block; color: var(--stamp); font-size: 12px; margin-bottom: 10px; }
-    .sku p { margin: 0; color: var(--muted); font-size: 13px; }
+    .sku p, .note { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+    .note code { color: var(--stamp); }
     section { padding: 18px 0 8px; }
     pre {
       margin: 0;
@@ -168,16 +169,16 @@ export function renderLanding(): string {
   <div class="wrap">
     <header>
       <div class="mark"><strong>BOTSUPPLY</strong><span>// marketplace</span></div>
-      <div class="pill">Dev credits · no card</div>
+      <div class="pill">1 credit = $0.01</div>
     </header>
     <div class="hero">
       <h1>Wholesale for <em>AI agents</em></h1>
-      <p class="lede">A B2B marketplace API. An agent opens a wallet, loads prepaid credits, and buys JSON packs and action recipes over HTTP. One credit is intended retail of $${CREDIT_VALUE_USD.toFixed(2)}. Nothing here talks to Stripe.</p>
+      <p class="lede">A B2B marketplace API. An agent opens a wallet, loads prepaid credits, and buys JSON packs and action recipes over HTTP. One credit is $${CREDIT_VALUE_USD.toFixed(2)}. The DEV top-up is free only while Stripe is unset. After the Stripe keys are set, agents pay through Checkout.</p>
       <div class="facts">
         <span>Base URL <b>/v1</b></span>
         <span>Auth <b>Bearer API key</b> on purchase</span>
         <span>Health <b>GET /health</b></span>
-        <span>Top-up <b>free in dev</b></span>
+        <span>DEV top-up <b>until Stripe</b></span>
       </div>
     </div>
     <section>
@@ -190,7 +191,7 @@ export function renderLanding(): string {
       <h2>How an agent buys</h2>
       <div class="steps">
         <div class="step"><b>01 Open a wallet</b><span>POST /v1/wallets returns wallet_id and api_key. The key is shown once.</span></div>
-        <div class="step"><b>02 Load credits</b><span>POST /v1/wallets/:id/topup adds development credits. No payment is collected.</span></div>
+        <div class="step"><b>02 DEV top-up</b><span>POST /v1/wallets/:id/topup adds free credits only when STRIPE_SECRET_KEY is unset.</span></div>
         <div class="step"><b>03 Read the sheet</b><span>GET /v1/catalog lists SKUs and credit prices. Payloads stay behind purchase.</span></div>
         <div class="step"><b>04 Take delivery</b><span>POST /v1/purchase spends credits and returns the JSON. GET /v1/purchases/:id replays it.</span></div>
       </div>
@@ -204,7 +205,7 @@ curl -s -X POST "$BASE/v1/wallets" \\
   -H 'content-type: application/json' \\
   -d '{"label":"desk-agent"}'
 
-# 2. Development top-up (free credits, no card)
+# 2. DEV top-up (free only when STRIPE_SECRET_KEY is unset)
 curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/topup" \\
   -H 'content-type: application/json' \\
   -d '{"credits":500}'
@@ -221,6 +222,15 @@ curl -s -X POST "$BASE/v1/purchase" \\
 # 5. Replay the delivery
 curl -s "$BASE/v1/purchases/$PURCHASE_ID" \\
   -H "authorization: Bearer $API_KEY"</code></pre>
+    </section>
+    <section>
+      <h2>Pay with Stripe</h2>
+      <p class="note">When <code>STRIPE_SECRET_KEY</code>, <code>STRIPE_WEBHOOK_SECRET</code>, and <code>PUBLIC_BASE_URL</code> are set, this opens Checkout at 1 cent per credit (minimum 100). The webhook credits the wallet once. The body field is <code>credits</code>.</p>
+      <pre><code>curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \\
+  -H "authorization: Bearer $API_KEY" \\
+  -H 'content-type: application/json' \\
+  -d '{"credits":500}'
+# open the returned url. Stripe then calls POST /v1/stripe/webhook</code></pre>
     </section>
     <footer>
       <span>1 credit = $${CREDIT_VALUE_USD.toFixed(2)} intended retail. Development top-ups are not invoiced.</span>
