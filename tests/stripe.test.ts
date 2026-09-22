@@ -6,8 +6,10 @@ import { applyStripeCheckoutCredit, createWallet, openDatabase } from "../src/db
 import {
   CENTS_PER_CREDIT,
   checkoutLineItem,
+  checkoutSessionParams,
   checkoutUrls,
   createStripeGateway,
+  hostedCheckoutUrl,
   stripeFromEnv,
   type CheckoutSessionInput,
   type StripeGateway,
@@ -38,12 +40,15 @@ function signature(payload: string): string {
 function testGateway(): { gateway: StripeGateway; calls: CheckoutSessionInput[] } {
   const calls: CheckoutSessionInput[] = [];
   const real = createStripeGateway("sk_test_botsupply", WEBHOOK_SECRET);
+  let n = 0;
   return {
     calls,
     gateway: {
       async createCheckoutSession(input) {
         calls.push(input);
-        return { id: "cs_test_created", url: "https://checkout.stripe.test/c/cs_test_created" };
+        n += 1;
+        const id = `cs_test_${n}`;
+        return { id, url: `https://checkout.stripe.com/c/pay/${id}#fid_test_${n}` };
       },
       constructEvent(payload, header) {
         return real.constructEvent(payload, header);
@@ -57,6 +62,24 @@ test("checkout line item is one cent per credit", () => {
   assert.equal(item.quantity, 500);
   assert.equal(item.price_data?.unit_amount, CENTS_PER_CREDIT);
   assert.equal(item.price_data?.currency, "usd");
+  const params = checkoutSessionParams({
+    walletId: "wal_123",
+    credits: 500,
+    successUrl: "https://botsupply.onrender.com/?checkout=success&session_id={CHECKOUT_SESSION_ID}",
+    cancelUrl: "https://botsupply.onrender.com/?checkout=cancel",
+  });
+  assert.equal(params.mode, "payment");
+  assert.equal(params.ui_mode, "hosted_page");
+  assert.equal(params.success_url?.includes("{CHECKOUT_SESSION_ID}"), true);
+  assert.equal(params.cancel_url?.startsWith("https://"), true);
+  assert.equal(params.metadata?.wallet_id, "wal_123");
+  assert.equal(params.metadata?.credits, "500");
+  assert.equal(params.line_items?.[0]?.price_data?.unit_amount, 1);
+  assert.equal(hostedCheckoutUrl("https://checkout.stripe.com/c/pay/cs_test_x"), null);
+  assert.equal(
+    hostedCheckoutUrl("https://checkout.stripe.com/c/pay/cs_test_x#fid_abc"),
+    "https://checkout.stripe.com/c/pay/cs_test_x#fid_abc",
+  );
   assert.deepEqual(checkoutUrls("https://botsupply.onrender.com/"), {
     successUrl: "https://botsupply.onrender.com/?checkout=success&session_id={CHECKOUT_SESSION_ID}",
     cancelUrl: "https://botsupply.onrender.com/?checkout=cancel",
@@ -157,8 +180,12 @@ test("checkout and webhook credit a wallet once, without calling Stripe", async 
       payload: { credits: 500 },
     });
     assert.equal(checkout.statusCode, 201, checkout.body);
-    assert.equal(checkout.json().url, "https://checkout.stripe.test/c/cs_test_created");
+    assert.equal(checkout.json().url, "https://botsupply.onrender.com/v1/pay/s/cs_test_1");
+    assert.equal(checkout.json().stripe_url, "https://checkout.stripe.com/c/pay/cs_test_1#fid_test_1");
     assert.equal(checkout.json().amount_cents, 500);
+    const hop = await app.inject({ method: "GET", url: "/v1/pay/s/cs_test_1" });
+    assert.equal(hop.statusCode, 302);
+    assert.equal(hop.headers.location, "https://checkout.stripe.com/c/pay/cs_test_1#fid_test_1");
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.walletId, wallet.wallet_id);
     assert.equal(calls[0]?.credits, 500);
@@ -174,7 +201,7 @@ test("checkout and webhook credit a wallet once, without calling Stripe", async 
     });
     assert.equal(mismatch.statusCode, 403);
 
-    const payload = paidEvent(wallet.wallet_id, 500, "cs_test_created");
+    const payload = paidEvent(wallet.wallet_id, 500, "cs_test_1");
     const deliver = () =>
       app.inject({
         method: "POST",
@@ -204,7 +231,7 @@ test("checkout and webhook credit a wallet once, without calling Stripe", async 
     assert.equal(bad.statusCode, 400);
     assert.equal(bad.json().error.code, "invalid_signature");
 
-    const unpaidPayload = payload.replace('"payment_status":"paid"', '"payment_status":"unpaid"').replace("cs_test_created", "cs_test_unpaid");
+    const unpaidPayload = payload.replace('"payment_status":"paid"', '"payment_status":"unpaid"').replace("cs_test_1", "cs_test_unpaid");
     const unpaid = await app.inject({
       method: "POST",
       url: "/v1/stripe/webhook",
@@ -243,6 +270,75 @@ test("checkout is unavailable and DEV top-up still works when Stripe is unset", 
     assert.equal(topup.statusCode, 200);
     assert.equal(topup.json().balance_credits, 100);
     assert.match(topup.json().note, /Development top-up/);
+    const pay = await app.inject({ method: "GET", url: "/v1/pay?credits=100" });
+    assert.equal(pay.statusCode, 503);
+  } finally {
+    await app.close();
+  }
+});
+
+test("GET /v1/pay redirects to a hosted Checkout URL that includes the fragment", async () => {
+  const { gateway, calls } = testGateway();
+  const app = await buildApp({
+    sqlitePath: ":memory:",
+    stripe: {
+      devTopupEnabled: false,
+      missing: [],
+      ready: { publicBaseUrl: "https://botsupply.onrender.com", gateway },
+    },
+  });
+  try {
+    const pay = await app.inject({ method: "GET", url: "/v1/pay?credits=100" });
+    assert.equal(pay.statusCode, 302);
+    assert.equal(pay.headers.location, "https://checkout.stripe.com/c/pay/cs_test_1#fid_test_1");
+    assert.match(String(pay.headers.location), /#/);
+    assert.equal(calls[0]?.credits, 100);
+    assert.match(calls[0]?.successUrl ?? "", /api_key=/);
+    assert.match(calls[0]?.successUrl ?? "", /\{CHECKOUT_SESSION_ID\}/);
+
+    const created = await app.inject({ method: "POST", url: "/v1/wallets", payload: {} });
+    const wallet = created.json() as { wallet_id: string };
+    const named = await app.inject({ method: "GET", url: `/v1/pay?credits=200&wallet_id=${wallet.wallet_id}` });
+    assert.equal(named.statusCode, 302);
+    assert.equal(calls[1]?.walletId, wallet.wallet_id);
+    assert.equal(calls[1]?.credits, 200);
+    assert.equal(calls[1]?.successUrl.includes("api_key="), false);
+
+    const low = await app.inject({ method: "GET", url: "/v1/pay?credits=10" });
+    assert.equal(low.statusCode, 400);
+
+    const bare = await buildApp({
+      sqlitePath: ":memory:",
+      stripe: {
+        devTopupEnabled: false,
+        missing: [],
+        ready: {
+          publicBaseUrl: "https://botsupply.onrender.com",
+          gateway: {
+            async createCheckoutSession() {
+              return { id: "cs_bare", url: "https://checkout.stripe.com/c/pay/cs_bare" };
+            },
+            constructEvent() {
+              throw new Error("unused");
+            },
+          },
+        },
+      },
+    });
+    try {
+      const createdWallet = await bare.inject({ method: "POST", url: "/v1/wallets", payload: {} });
+      const body = createdWallet.json() as { wallet_id: string; api_key: string };
+      const broken = await bare.inject({
+        method: "POST",
+        url: `/v1/wallets/${body.wallet_id}/checkout`,
+        headers: { authorization: `Bearer ${body.api_key}` },
+        payload: { credits: 100 },
+      });
+      assert.equal(broken.statusCode, 502);
+      assert.equal(broken.json().error.code, "incomplete_checkout_url");
+    } finally {
+      await bare.close();
+    }
   } finally {
     await app.close();
   }

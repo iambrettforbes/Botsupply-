@@ -30,8 +30,25 @@ function skuRow(product: Product): string {
   </article>`;
 }
 
-export function renderLanding(): string {
+export type LandingQuery = {
+  checkout?: string;
+  wallet_id?: string;
+  api_key?: string;
+};
+
+function paidBanner(query: LandingQuery | undefined): string {
+  if (query?.checkout !== "success" || !query.wallet_id || !query.api_key) return "";
+  return `<section class="paid">
+    <h2>Payment return</h2>
+    <p class="note">If Checkout completed, this wallet can spend credits. The API key is shown once on this page.</p>
+    <pre><code>wallet_id ${esc(query.wallet_id)}
+api_key ${esc(query.api_key)}</code></pre>
+  </section>`;
+}
+
+export function renderLanding(query?: LandingQuery): string {
   const rows = PRODUCTS.map(skuRow).join("\n");
+  const banner = paidBanner(query);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -166,7 +183,8 @@ export function renderLanding(): string {
   </style>
 </head>
 <body>
-  <div class="wrap">
+    <div class="wrap">
+    ${banner}
     <header>
       <div class="mark"><strong>BOTSUPPLY</strong><span>// marketplace</span></div>
       <div class="pill">1 credit = $0.01</div>
@@ -225,12 +243,15 @@ curl -s "$BASE/v1/purchases/$PURCHASE_ID" \\
     </section>
     <section>
       <h2>Pay with Stripe</h2>
-      <p class="note">When <code>STRIPE_SECRET_KEY</code>, <code>STRIPE_WEBHOOK_SECRET</code>, and <code>PUBLIC_BASE_URL</code> are set, this opens Checkout at 1 cent per credit (minimum 100). The webhook credits the wallet once. The body field is <code>credits</code>.</p>
-      <pre><code>curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \\
+      <p class="note">When <code>STRIPE_SECRET_KEY</code>, <code>STRIPE_WEBHOOK_SECRET</code>, and <code>PUBLIC_BASE_URL</code> are set, Checkout is 1 cent per credit (minimum 100). Open the returned <code>url</code>. It redirects to hosted Checkout and keeps the fragment Stripe requires. A copied session id alone shows “This link is incomplete.” The webhook credits the wallet once.</p>
+      <pre><code># Browser. New demo wallet, then redirect to Checkout.
+https://botsupply.onrender.com/v1/pay?credits=100
+
+# API. Body field is credits. url is a short redirect, not a bare session id.
+curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \\
   -H "authorization: Bearer $API_KEY" \\
   -H 'content-type: application/json' \\
-  -d '{"credits":500}'
-# open the returned url. Stripe then calls POST /v1/stripe/webhook</code></pre>
+  -d '{"credits":500}'</code></pre>
     </section>
     <footer>
       <span>1 credit = $${CREDIT_VALUE_USD.toFixed(2)} intended retail. Development top-ups are not invoiced.</span>

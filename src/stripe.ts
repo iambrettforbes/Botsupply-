@@ -54,6 +54,31 @@ export function checkoutLineItem(credits: number): Stripe.Checkout.SessionCreate
   };
 }
 
+/** Hosted Checkout params. `ui_mode` must be `hosted_page` or Stripe omits a usable `url`. */
+export function checkoutSessionParams(input: CheckoutSessionInput): Stripe.Checkout.SessionCreateParams {
+  return {
+    mode: "payment",
+    ui_mode: "hosted_page",
+    success_url: input.successUrl,
+    cancel_url: input.cancelUrl,
+    client_reference_id: input.walletId,
+    metadata: {
+      wallet_id: input.walletId,
+      credits: String(input.credits),
+    },
+    line_items: [checkoutLineItem(input.credits)],
+  };
+}
+
+/**
+ * Hosted Checkout URLs are incomplete without the `#...` fragment.
+ * Opening the session id alone shows Stripe's "This link is incomplete" page.
+ */
+export function hostedCheckoutUrl(url: string | null | undefined): string | null {
+  if (!url || !url.startsWith("https://") || !url.includes("#")) return null;
+  return url;
+}
+
 export function checkoutUrls(publicBaseUrl: string): { successUrl: string; cancelUrl: string } {
   const base = publicBaseUrl.replace(/\/$/, "");
   return {
@@ -66,17 +91,7 @@ export function createStripeGateway(secretKey: string, webhookSecret: string): S
   const stripe = new Stripe(secretKey);
   return {
     async createCheckoutSession(input) {
-      const session = await stripe.checkout.sessions.create({
-        mode: "payment",
-        success_url: input.successUrl,
-        cancel_url: input.cancelUrl,
-        client_reference_id: input.walletId,
-        metadata: {
-          wallet_id: input.walletId,
-          credits: String(input.credits),
-        },
-        line_items: [checkoutLineItem(input.credits)],
-      });
+      const session = await stripe.checkout.sessions.create(checkoutSessionParams(input));
       return { id: session.id, url: session.url };
     },
     constructEvent(payload, signature) {
