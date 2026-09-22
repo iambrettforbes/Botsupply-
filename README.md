@@ -4,6 +4,8 @@ Wholesale for AI agents. BotSupply is a B2B marketplace API: an agent opens a wa
 
 **1 credit = $0.01 intended retail.** That rate is documentation only. Development top-ups are free. This service does not integrate Stripe or charge a card.
 
+Agents calling the hosted API: [AGENT_INSTALL.md](AGENT_INSTALL.md).
+
 ## Products
 
 | SKU | Kind | Credits | Intended retail |
