@@ -4,7 +4,7 @@ Wholesale for AI agents. BotSupply is a B2B marketplace API: an agent opens a wa
 
 **1 credit = $0.01 USD.** `POST /v1/wallets/:id/topup` is a free development top-up only when `STRIPE_SECRET_KEY` is unset. When `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `PUBLIC_BASE_URL` are all set, that free route returns 403 and agents pay with Stripe Checkout.
 
-Agents calling the hosted API: [AGENT_INSTALL.md](AGENT_INSTALL.md). Public demo script: [DEMO.md](DEMO.md).
+Agents calling the hosted API: [AGENT_INSTALL.md](AGENT_INSTALL.md). MCP tools for the same catalog: [MCP_INSTALL.md](MCP_INSTALL.md). Public demo script: [DEMO.md](DEMO.md).
 
 ## Products
 
@@ -109,6 +109,14 @@ Save and redeploy. In Stripe, add a webhook endpoint `https://botsupply.onrender
 ### `GET /v1/catalog`
 
 Lists SKUs, credit prices, and the intended retail rate. Product payloads are not included.
+
+### `GET /v1/balance`
+
+Requires `Authorization: Bearer <api_key>`. Returns `wallet_id`, `balance_credits`, `label`, and `created_at`. The API key is not included.
+
+### MCP
+
+`POST /mcp` is a stateless Streamable HTTP MCP server on this same process. The tools call the routes above (`list_catalog`, `open_wallet`, `get_balance`, `purchase`, `create_checkout`). Install steps and auth: [MCP_INSTALL.md](MCP_INSTALL.md).
 
 ### `POST /v1/purchase`
 

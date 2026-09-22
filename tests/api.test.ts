@@ -25,6 +25,19 @@ async function createWallet(app: Awaited<ReturnType<typeof buildApp>>, label = "
   assert.match(body.wallet_id, /^wal_[0-9a-f]+$/);
   assert.match(body.api_key, /^bsk_[0-9a-f]+$/);
   assert.equal(body.balance_credits, 0);
+
+  const balance = await app.inject({
+    method: "GET",
+    url: "/v1/balance",
+    headers: { authorization: `Bearer ${body.api_key}` },
+  });
+  assert.equal(balance.statusCode, 200);
+  assert.equal(balance.json().wallet_id, body.wallet_id);
+  assert.equal(balance.json().balance_credits, 0);
+  assert.equal(balance.json().api_key, undefined);
+
+  const hidden = await app.inject({ method: "GET", url: "/v1/balance" });
+  assert.equal(hidden.statusCode, 401);
   return body;
 }
 
@@ -43,6 +56,7 @@ test("health, landing page, and catalog", async () => {
     assert.match(home.body, /AI agents/);
     assert.match(home.body, /Pay with Stripe/);
     assert.match(home.body, /DEV top-up/);
+    assert.match(home.body, /POST \/mcp/);
     for (const product of PRODUCTS) {
       assert.match(home.body, new RegExp(product.sku.replace(".", "\\.")));
     }

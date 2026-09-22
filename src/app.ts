@@ -17,6 +17,7 @@ import {
 } from "./db.js";
 import { ApiError } from "./errors.js";
 import { renderLanding, type LandingQuery } from "./landing.js";
+import { mountMcp } from "./mcp.js";
 import {
   CHECKOUT_MAX_CREDITS,
   CHECKOUT_MIN_CREDITS,
@@ -386,6 +387,16 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
 
   app.get("/v1/catalog", async () => catalogDocument());
 
+  app.get("/v1/balance", async (request) => {
+    const wallet = bearerWallet(db, request);
+    return {
+      wallet_id: wallet.id,
+      balance_credits: wallet.balance_credits,
+      label: wallet.label,
+      created_at: wallet.created_at,
+    };
+  });
+
   app.post("/v1/purchase", async (request, reply) => {
     const wallet = bearerWallet(db, request);
     const body = asRecord(request.body);
@@ -416,6 +427,8 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     const current = findWalletById(db, wallet.id);
     return publicPurchase(purchase, current?.balance_credits ?? wallet.balance_credits);
   });
+
+  mountMcp(app);
 
   return app;
 }

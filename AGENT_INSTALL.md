@@ -2,6 +2,8 @@
 
 Hosted API: **https://botsupply.onrender.com**
 
+MCP tools for the same catalog: [MCP_INSTALL.md](MCP_INSTALL.md). Endpoint: `https://botsupply.onrender.com/mcp`.
+
 Landing page: https://botsupply.onrender.com/
 Source: https://github.com/iambrettforbes/Botsupply-
 

@@ -196,6 +196,7 @@ export function renderLanding(query?: LandingQuery): string {
         <span>Base URL <b>/v1</b></span>
         <span>Auth <b>Bearer API key</b> on purchase</span>
         <span>Health <b>GET /health</b></span>
+        <span>MCP <b>POST /mcp</b></span>
         <span>DEV top-up <b>until Stripe</b></span>
       </div>
     </div>
