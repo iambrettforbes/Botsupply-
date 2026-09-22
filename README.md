@@ -2,7 +2,7 @@
 
 Wholesale for AI agents. BotSupply is a B2B marketplace API: an agent opens a wallet, loads prepaid credits, and buys JSON products.
 
-**1 credit = $0.01 intended retail.** That rate is documentation only. Development top-ups are free. This service does not integrate Stripe or charge a card.
+**1 credit = $0.01 USD.** `POST /v1/wallets/:id/topup` is a free development top-up only when `STRIPE_SECRET_KEY` is unset. When `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `PUBLIC_BASE_URL` are all set, that free route returns 403 and agents pay with Stripe Checkout.
 
 Agents calling the hosted API: [AGENT_INSTALL.md](AGENT_INSTALL.md).
 
@@ -65,7 +65,7 @@ curl -s -X POST http://127.0.0.1:4317/v1/wallets \
 
 ### `POST /v1/wallets/:id/topup`
 
-Development credit top-up. No payment is collected.
+DEV credit top-up. No payment is collected. This is the current behavior only when `STRIPE_SECRET_KEY` is unset (local runs and the hosted service before Stripe keys are added). After the key is set, the route returns **403** `dev_topup_disabled`.
 
 ```bash
 curl -s -X POST http://127.0.0.1:4317/v1/wallets/$WALLET_ID/topup \
@@ -74,6 +74,33 @@ curl -s -X POST http://127.0.0.1:4317/v1/wallets/$WALLET_ID/topup \
 ```
 
 `credits` is an integer from 1 to 1000000.
+
+### `POST /v1/wallets/:id/checkout`
+
+Paid top-up. Requires `Authorization: Bearer <api_key>` for that wallet, and all three Stripe env vars. Body is `{ "credits": number }` from 100 to 100000. Each credit is a 1-cent Checkout line item (`unit_amount` 1, quantity = credits).
+
+```bash
+curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \
+  -H "authorization: Bearer $API_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"credits":500}'
+```
+
+The response includes a Stripe `url`. Credits are applied when Stripe calls `POST /v1/stripe/webhook` with `checkout.session.completed` and `payment_status` `paid`. The same Checkout Session id is credited once.
+
+### Stripe on Render
+
+The live service does not charge cards until these are set. In the Render Dashboard, open the **botsupply** service, then **Environment**, and add:
+
+| Key | Value |
+| --- | --- |
+| `STRIPE_SECRET_KEY` | Secret key from Stripe (`sk_test_…` or `sk_live_…`). Do not commit it. |
+| `STRIPE_WEBHOOK_SECRET` | Signing secret for the endpoint below (`whsec_…`). |
+| `PUBLIC_BASE_URL` | `https://botsupply.onrender.com` |
+
+Save and redeploy. In Stripe, add a webhook endpoint `https://botsupply.onrender.com/v1/stripe/webhook` for the event `checkout.session.completed`, then paste its signing secret into `STRIPE_WEBHOOK_SECRET`.
+
+`render.yaml` lists the two secrets with `sync: false` and sets `PUBLIC_BASE_URL`. The service already exists, so fill the secrets in the Dashboard. An empty value counts as unset, and the DEV top-up stays on until `STRIPE_SECRET_KEY` is non-empty. Leave the key unset to keep free top-ups.
 
 ### `GET /v1/catalog`
 
@@ -108,7 +135,7 @@ Replays a purchase for the wallet that owns it. Same bearer token as purchase.
 npm test
 ```
 
-Covers wallet creation, development top-up, a purchase of each SKU, and exact credit deduction.
+Covers wallet creation, the DEV top-up, a purchase of each SKU, credit deduction, and idempotent Stripe credit application. Checkout tests use a fake Stripe client and do not call the network.
 
 ## Deploy
 

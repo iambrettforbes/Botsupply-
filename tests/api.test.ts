@@ -41,6 +41,8 @@ test("health, landing page, and catalog", async () => {
     assert.match(home.body, /BotSupply/);
     assert.match(home.body, /Wholesale for/);
     assert.match(home.body, /AI agents/);
+    assert.match(home.body, /Pay with Stripe/);
+    assert.match(home.body, /DEV top-up/);
     for (const product of PRODUCTS) {
       assert.match(home.body, new RegExp(product.sku.replace(".", "\\.")));
     }

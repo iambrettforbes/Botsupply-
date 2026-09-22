@@ -2,7 +2,7 @@
 
 The app is a single Node.js process. It listens on `0.0.0.0:$PORT` (default `4317`) and serves `GET /health` for platform checks. SQLite is stored at `/data/botsupply.sqlite` when that directory is writable, otherwise at `./data/botsupply.sqlite`. Set `SQLITE_PATH` to override.
 
-**1 credit = $0.01 intended retail.** Top-ups are a development convenience. There is no Stripe billing to configure.
+**1 credit = $0.01 USD.** DEV top-up stays free until `STRIPE_SECRET_KEY` is set. Paid Checkout needs the Stripe variables below.
 
 ## Environment
 
@@ -11,6 +11,9 @@ The app is a single Node.js process. It listens on `0.0.0.0:$PORT` (default `431
 | `PORT` | Set by Render and by `fly.toml` | HTTP port. Defaults to `4317`. |
 | `NODE_ENV` | No | `production` in the container and on Render. |
 | `SQLITE_PATH` | No | Absolute path to the SQLite file. |
+| `STRIPE_SECRET_KEY` | No | Stripe secret key. When set, DEV top-up is disabled. |
+| `STRIPE_WEBHOOK_SECRET` | With the secret key | Signing secret for `POST /v1/stripe/webhook`. |
+| `PUBLIC_BASE_URL` | With the secret key | Public origin for Checkout success and cancel URLs, no trailing path. |
 
 ## Docker
 
@@ -46,8 +49,10 @@ To keep SQLite across deploys, move the service to a paid plan and attach a 1 GB
 
 1. Push this repo to GitHub, including `render.yaml` and `Dockerfile`.
 2. Open [the Blueprint deeplink](https://dashboard.render.com/blueprint/new?repo=https://github.com/iambrettforbes/Botsupply-).
-3. Review the `botsupply` web service. There are no secrets to fill in.
+3. Review the `botsupply` web service. `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` are `sync: false` — enter them in the Dashboard, not in git. `PUBLIC_BASE_URL` is `https://botsupply.onrender.com`.
 4. Apply, then wait until the deploy is live.
+
+The service is already live, so add keys on the existing service: Render Dashboard → **botsupply** → **Environment**. Set `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `PUBLIC_BASE_URL=https://botsupply.onrender.com`, then save and redeploy. In Stripe, create a webhook endpoint `https://botsupply.onrender.com/v1/stripe/webhook` listening for `checkout.session.completed`, and store its signing secret as `STRIPE_WEBHOOK_SECRET`. Leave `STRIPE_SECRET_KEY` empty to keep the free DEV top-up.
 5. Confirm `GET https://<service>.onrender.com/health` returns `{"status":"ok","service":"botsupply"}`.
 
 Render sets `PORT`. The Dockerfile does not hard-code it.
