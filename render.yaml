@@ -1,0 +1,17 @@
+# BotSupply — Docker web service.
+# Free instances have an ephemeral filesystem. SQLite under /data survives
+# only for the life of the instance. A paid plan can add a disk mounted at
+# /data; see DEPLOY.md. Do not attach a disk on the free plan.
+services:
+  - type: web
+    name: botsupply
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_ENV
+        value: production
