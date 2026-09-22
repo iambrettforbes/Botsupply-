@@ -1,26 +1,31 @@
 import { Readable } from "node:stream";
-import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
+import type Database from "better-sqlite3";
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { catalogDocument, findProduct } from "./catalog.js";
 import {
   applyStripeCheckoutCredit,
   createWallet,
+  findCheckoutSessionUrl,
   findPurchase,
   findWalletByApiKey,
   findWalletById,
   openDatabase,
   purchaseSku,
+  saveCheckoutSessionUrl,
   topUpWallet,
   type WalletRow,
 } from "./db.js";
 import { ApiError } from "./errors.js";
-import { renderLanding } from "./landing.js";
+import { renderLanding, type LandingQuery } from "./landing.js";
 import {
   CHECKOUT_MAX_CREDITS,
   CHECKOUT_MIN_CREDITS,
   checkoutUrls,
+  hostedCheckoutUrl,
   stripeFromEnv,
   type CheckoutCompletedEvent,
   type ResolvedStripe,
+  type StripeConfig,
 } from "./stripe.js";
 
 export type BuildOptions = {
@@ -132,6 +137,56 @@ function sessionFromEvent(event: CheckoutCompletedEvent): {
   };
 }
 
+function readPayCredits(raw: string | undefined): number {
+  if (raw == null || raw === "") return CHECKOUT_MIN_CREDITS;
+  if (!/^\d+$/.test(raw)) {
+    throw new ApiError(
+      400,
+      "bad_request",
+      `credits must be an integer from ${CHECKOUT_MIN_CREDITS} to ${CHECKOUT_MAX_CREDITS}`,
+    );
+  }
+  return readCredits({ credits: Number(raw) }, CHECKOUT_MIN_CREDITS, CHECKOUT_MAX_CREDITS);
+}
+
+function redirectToCheckout(reply: FastifyReply, url: string) {
+  return reply.header("location", url).code(302).send();
+}
+
+async function openHostedCheckout(
+  request: FastifyRequest,
+  ready: StripeConfig,
+  db: Database.Database,
+  input: { walletId: string; credits: number; successUrl: string; cancelUrl: string },
+) {
+  let session: { id: string; url: string | null };
+  try {
+    session = await ready.gateway.createCheckoutSession(input);
+  } catch (error) {
+    request.log.error(error);
+    throw new ApiError(502, "stripe_error", "Stripe could not create a Checkout Session");
+  }
+  const stripeUrl = hostedCheckoutUrl(session.url);
+  if (!stripeUrl) {
+    throw new ApiError(
+      502,
+      "incomplete_checkout_url",
+      "Stripe returned a Checkout URL without the hosted-page fragment",
+    );
+  }
+  saveCheckoutSessionUrl(db, {
+    sessionId: session.id,
+    walletId: input.walletId,
+    credits: input.credits,
+    url: stripeUrl,
+  });
+  return {
+    sessionId: session.id,
+    stripeUrl,
+    payUrl: `${ready.publicBaseUrl}/v1/pay/s/${encodeURIComponent(session.id)}`,
+  };
+}
+
 export async function buildApp(options: BuildOptions): Promise<FastifyInstance> {
   const app = Fastify({ logger: options.logger ?? false });
   const db = openDatabase(options.sqlitePath);
@@ -173,8 +228,9 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
 
   app.get("/health", async () => ({ status: "ok", service: "botsupply" }));
 
-  app.get("/", async (_request, reply) => {
-    return reply.type("text/html; charset=utf-8").send(renderLanding());
+  app.get("/", async (request, reply) => {
+    const query = request.query as LandingQuery;
+    return reply.type("text/html; charset=utf-8").send(renderLanding(query));
   });
 
   app.post("/v1/wallets", async (request, reply) => {
@@ -234,29 +290,57 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     rejectUnknown(body, ["credits"]);
     const credits = readCredits(body, CHECKOUT_MIN_CREDITS, CHECKOUT_MAX_CREDITS);
     const urls = checkoutUrls(stripe.ready.publicBaseUrl);
-    let session: { id: string; url: string | null };
-    try {
-      session = await stripe.ready.gateway.createCheckoutSession({
-        walletId: wallet.id,
-        credits,
-        successUrl: urls.successUrl,
-        cancelUrl: urls.cancelUrl,
-      });
-    } catch (error) {
-      request.log.error(error);
-      throw new ApiError(502, "stripe_error", "Stripe could not create a Checkout Session");
-    }
-    if (!session.url) {
-      throw new ApiError(502, "stripe_error", "Stripe did not return a Checkout URL");
-    }
+    const opened = await openHostedCheckout(request, stripe.ready, db, {
+      walletId: wallet.id,
+      credits,
+      successUrl: urls.successUrl,
+      cancelUrl: urls.cancelUrl,
+    });
     return reply.status(201).send({
-      checkout_session_id: session.id,
-      url: session.url,
+      checkout_session_id: opened.sessionId,
+      url: opened.payUrl,
+      stripe_url: opened.stripeUrl,
       wallet_id: wallet.id,
       credits,
       amount_cents: credits,
       currency: "usd",
     });
+  });
+
+  app.get("/v1/pay/s/:sessionId", async (request, reply) => {
+    const { sessionId } = request.params as { sessionId: string };
+    const saved = findCheckoutSessionUrl(db, sessionId);
+    if (!saved) throw new ApiError(404, "not_found", "Checkout session not found");
+    return redirectToCheckout(reply, saved.url);
+  });
+
+  app.get("/v1/pay", async (request, reply) => {
+    if (!stripe.ready) {
+      const missing = stripe.devTopupEnabled
+        ? ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "PUBLIC_BASE_URL"]
+        : stripe.missing;
+      throw new ApiError(503, "stripe_not_configured", `Stripe checkout is not configured. Set ${missing.join(", ")}.`);
+    }
+    const query = request.query as { credits?: string; wallet_id?: string };
+    const credits = readPayCredits(query.credits);
+    const urls = checkoutUrls(stripe.ready.publicBaseUrl);
+    let walletId = query.wallet_id?.trim() ?? "";
+    let successUrl = urls.successUrl;
+    if (!walletId) {
+      const created = createWallet(db, "pay-link");
+      walletId = created.wallet.id;
+      const base = stripe.ready.publicBaseUrl;
+      successUrl = `${base}/?checkout=success&wallet_id=${encodeURIComponent(created.wallet.id)}&api_key=${encodeURIComponent(created.apiKey)}&session_id={CHECKOUT_SESSION_ID}`;
+    } else if (!findWalletById(db, walletId)) {
+      throw new ApiError(404, "not_found", "Wallet not found");
+    }
+    const opened = await openHostedCheckout(request, stripe.ready, db, {
+      walletId,
+      credits,
+      successUrl,
+      cancelUrl: urls.cancelUrl,
+    });
+    return redirectToCheckout(reply, opened.stripeUrl);
   });
 
   app.post("/v1/stripe/webhook", async (request, reply) => {

@@ -38,7 +38,13 @@ curl -s -X POST "$BASE/v1/purchase" \
 
 ## Pay with Stripe
 
-When `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `PUBLIC_BASE_URL` are set, skip `/topup`:
+When `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `PUBLIC_BASE_URL` are set, skip `/topup`.
+
+Browser (new demo wallet, then Stripe Checkout):
+
+https://botsupply.onrender.com/v1/pay?credits=100
+
+`?wallet_id=wal_…` pays into an existing wallet. The hosted Checkout URL includes a `#` fragment. Opening the session id without that fragment shows “This link is incomplete.” Use `/v1/pay` or the `url` from checkout; do not rebuild the Stripe link yourself.
 
 ```bash
 curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \

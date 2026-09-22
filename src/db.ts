@@ -46,6 +46,13 @@ export function openDatabase(sqlitePath: string): Database.Database {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_purchases_wallet ON purchases(wallet_id);
+    CREATE TABLE IF NOT EXISTS stripe_checkout_sessions (
+      session_id TEXT PRIMARY KEY,
+      wallet_id TEXT NOT NULL REFERENCES wallets(id),
+      credits INTEGER NOT NULL,
+      url TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS stripe_checkout_credits (
       session_id TEXT PRIMARY KEY,
       wallet_id TEXT NOT NULL REFERENCES wallets(id),
@@ -153,6 +160,26 @@ export type ApplyStripeCreditResult =
  * Credits a wallet for a paid Checkout Session. The session id is the idempotency key:
  * a second call with the same id does not add credits again.
  */
+export function saveCheckoutSessionUrl(
+  db: Database.Database,
+  input: { sessionId: string; walletId: string; credits: number; url: string },
+): void {
+  db.prepare(
+    `INSERT INTO stripe_checkout_sessions (session_id, wallet_id, credits, url, created_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(session_id) DO UPDATE SET url = excluded.url`,
+  ).run(input.sessionId, input.walletId, input.credits, input.url, new Date().toISOString());
+}
+
+export function findCheckoutSessionUrl(
+  db: Database.Database,
+  sessionId: string,
+): { session_id: string; wallet_id: string; credits: number; url: string } | undefined {
+  return db
+    .prepare("SELECT session_id, wallet_id, credits, url FROM stripe_checkout_sessions WHERE session_id = ?")
+    .get(sessionId) as { session_id: string; wallet_id: string; credits: number; url: string } | undefined;
+}
+
 export function applyStripeCheckoutCredit(
   db: Database.Database,
   input: { sessionId: string; walletId: string; credits: number },

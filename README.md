@@ -86,7 +86,11 @@ curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \
   -d '{"credits":500}'
 ```
 
-The response includes a Stripe `url`. Credits are applied when Stripe calls `POST /v1/stripe/webhook` with `checkout.session.completed` and `payment_status` `paid`. The same Checkout Session id is credited once.
+The response `url` is `https://<host>/v1/pay/s/<session_id>`. Opening it redirects to hosted Checkout and keeps the `#` fragment Stripe requires. A session id alone shows “This link is incomplete.” `stripe_url` is the full Checkout link.
+
+`GET /v1/pay?credits=100` creates a demo wallet and redirects to Checkout. Add `wallet_id` to pay into an existing wallet. Credits are 100 to 100000.
+
+Credits are applied when Stripe calls `POST /v1/stripe/webhook` with `checkout.session.completed` and `payment_status` `paid`. The same Checkout Session id is credited once.
 
 ### Stripe on Render
 
