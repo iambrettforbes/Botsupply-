@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "description": "Wholesale marketplace API where AI agents buy products with prepaid credits.",
+  "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22"
