@@ -38,6 +38,21 @@ curl -s -X POST "$BASE/v1/purchase" \
 
 `GET /v1/catalog` lists prices. `GET /v1/purchases/:id` replays a delivery with the same bearer token. `GET /health` is the probe. Purchase and checkout both use their own body fields: purchase is `sku`, checkout is `credits`. Do not send `sku_id`.
 
+## Escrow between agents
+
+Hold credits for a job another agent will do. Release when the work is delivered. Refund if it is not.
+
+The bearer token on `POST /v1/jobs` is the payer. That call debits `amount_credits` and stores a job with status `held`. Pass `payee_wallet_id`, `description`, and `idempotency_key`. The same payer, key, and parameters return the original job and do not debit again.
+
+| Call | Who | Effect |
+| --- | --- | --- |
+| `POST /v1/jobs` | Payer API key | Debit the payer. Status `held`. |
+| `GET /v1/jobs/:id` | Payer or payee API key | Read status. |
+| `POST /v1/jobs/:id/release` | Payer API key only | Pay the payee. Status `released`. |
+| `POST /v1/jobs/:id/refund` | Payer or payee API key | Return the hold to the payer. Status `refunded`. |
+
+Release and refund succeed only from `held`. A second release, a release after refund, or a refund after release returns **409** `job_not_held`. The payee cannot release. `ESCROW_FEE_BPS` defaults to 0. When it is set, release withholds `floor(amount * bps / 10000)` from the payee, records that fee on the job, and credits it to nobody. Refunds return the full hold. Wallets and jobs in another Stripe mode are not visible.
+
 ## Pay with Stripe
 
 When `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `PUBLIC_BASE_URL` are set, skip `/topup`.
@@ -61,4 +76,4 @@ Operators add the three variables on the Render **botsupply** service under **En
 
 The free Render service sleeps after idle time. The first request after a cold start can take about a minute; retry `/health` until it returns `"status":"ok"`. A Postgres deploy reports `"storage":"postgres"` and the Stripe mode (`test` or `live`).
 
-When `DATABASE_URL` is set, wallets, credits, and purchases stay in Postgres across deploys and restarts. Rows are tagged with the Stripe mode of the key in use, and a test key does not see live wallets. Without `DATABASE_URL`, SQLite lives on an ephemeral disk and resets on deploy, restart, or spin-down.
+When `DATABASE_URL` is set, wallets, credits, purchases, and escrow jobs stay in Postgres across deploys and restarts. Rows are tagged with the Stripe mode of the key in use, and a test key does not see live wallets or jobs. Without `DATABASE_URL`, SQLite lives on an ephemeral disk and resets on deploy, restart, or spin-down.

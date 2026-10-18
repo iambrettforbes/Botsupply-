@@ -1,18 +1,27 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { clampFeeBps, escrowFeeCredits } from "./escrow.js";
 import type { StripeMode } from "./stripe.js";
 import {
   hashApiKey,
+  isUniqueConstraint,
+  mapJob,
   mapPurchase,
   mapWallet,
   newApiKey,
   newId,
+  sameJobRequest,
   type ApplyStripeCreditResult,
   type CheckoutSessionRow,
   type CheckoutSessionSave,
+  type CreateJobInput,
+  type CreateJobResult,
+  type JobBalances,
+  type JobRow,
   type PurchaseResult,
   type PurchaseRow,
+  type SettleJobResult,
   type Store,
   type StripeCreditInput,
   type WalletRow,
@@ -54,7 +63,26 @@ const SCHEMA = `
     created_at TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_wallets_mode_hash ON wallets (mode, api_key_hash);
+  CREATE TABLE IF NOT EXISTS escrow_jobs (
+    id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    payer_wallet_id TEXT NOT NULL REFERENCES wallets(id),
+    payee_wallet_id TEXT NOT NULL REFERENCES wallets(id),
+    amount_credits INTEGER NOT NULL,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('held', 'released', 'refunded')),
+    idempotency_key TEXT NOT NULL,
+    fee_bps INTEGER NOT NULL DEFAULT 0,
+    fee_credits INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (mode, payer_wallet_id, idempotency_key)
+  );
+  CREATE INDEX IF NOT EXISTS idx_escrow_jobs_mode_payer ON escrow_jobs (mode, payer_wallet_id);
 `;
+
+const JOB_SELECT = `id, payer_wallet_id, payee_wallet_id, amount_credits, description, status,
+  idempotency_key, fee_bps, fee_credits, created_at, updated_at`;
 
 function tableColumns(db: Database.Database, table: string): string[] {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
@@ -247,7 +275,172 @@ export function openSqliteStore(sqlitePath: string, mode: StripeMode): Store {
       });
       return run();
     },
+    async createJob(input) {
+      if (!Number.isInteger(input.amountCredits) || input.amountCredits < 1) {
+        return { ok: false, code: "invalid_amount" };
+      }
+      if (input.payerWalletId === input.payeeWalletId) return { ok: false, code: "same_wallet" };
+      const run = db.transaction((): CreateJobResult => {
+        const existing = selectJob(
+          "mode = ? AND payer_wallet_id = ? AND idempotency_key = ?",
+          mode,
+          input.payerWalletId,
+          input.idempotencyKey,
+        );
+        if (existing) return replayCreate(input, existing);
+        return insertHeldJob(input);
+      });
+      try {
+        return run.immediate();
+      } catch (error) {
+        if (!isUniqueConstraint(error)) throw error;
+        const existing = selectJob(
+          "mode = ? AND payer_wallet_id = ? AND idempotency_key = ?",
+          mode,
+          input.payerWalletId,
+          input.idempotencyKey,
+        );
+        if (!existing) throw error;
+        return replayCreate(input, existing);
+      }
+    },
+    async getJob(id) {
+      return selectJob("id = ? AND mode = ?", id, mode);
+    },
+    async releaseJob(id, feeBps) {
+      const run = db.transaction((): SettleJobResult =>
+        settle(id, "released", (job) => {
+          const feeCredits = escrowFeeCredits(job.amount_credits, feeBps);
+          return {
+            feeBps: clampFeeBps(feeBps),
+            feeCredits,
+            creditWalletId: job.payee_wallet_id,
+            credit: job.amount_credits - feeCredits,
+          };
+        }),
+      );
+      return run.immediate();
+    },
+    async refundJob(id) {
+      const run = db.transaction((): SettleJobResult =>
+        settle(id, "refunded", (job) => ({
+          feeBps: 0,
+          feeCredits: 0,
+          creditWalletId: job.payer_wallet_id,
+          credit: job.amount_credits,
+        })),
+      );
+      return run.immediate();
+    },
   };
+
+  function selectJob(where: string, ...params: string[]): JobRow | undefined {
+    const row = db.prepare(`SELECT ${JOB_SELECT} FROM escrow_jobs WHERE ${where}`).get(...params) as
+      | Parameters<typeof mapJob>[0]
+      | undefined;
+    return row ? mapJob(row) : undefined;
+  }
+
+  function walletBalances(payerId: string, payeeId: string): JobBalances {
+    return {
+      payer_balance_credits: findWalletById(payerId)?.balance_credits ?? 0,
+      payee_balance_credits: findWalletById(payeeId)?.balance_credits ?? 0,
+    };
+  }
+
+  function replayCreate(input: CreateJobInput, job: JobRow): CreateJobResult {
+    if (!sameJobRequest(job, input)) return { ok: false, code: "idempotency_conflict", job };
+    return { ok: true, job, replay: true, ...walletBalances(job.payer_wallet_id, job.payee_wallet_id) };
+  }
+
+  function insertHeldJob(input: CreateJobInput): CreateJobResult {
+    const payer = findWalletById(input.payerWalletId);
+    const payee = findWalletById(input.payeeWalletId);
+    if (!payer) return { ok: false, code: "wallet_not_found", which: "payer" };
+    if (!payee) return { ok: false, code: "wallet_not_found", which: "payee" };
+    const debited = db
+      .prepare(
+        `UPDATE wallets SET balance_credits = balance_credits - ?
+         WHERE id = ? AND mode = ? AND balance_credits >= ?`,
+      )
+      .run(input.amountCredits, input.payerWalletId, mode, input.amountCredits);
+    if (debited.changes !== 1) {
+      return { ok: false, code: "insufficient_credits", balance_credits: findWalletById(input.payerWalletId)?.balance_credits ?? 0 };
+    }
+    const now = new Date().toISOString();
+    const job: JobRow = {
+      id: newId("job"),
+      payer_wallet_id: input.payerWalletId,
+      payee_wallet_id: input.payeeWalletId,
+      amount_credits: input.amountCredits,
+      description: input.description,
+      status: "held",
+      idempotency_key: input.idempotencyKey,
+      fee_bps: 0,
+      fee_credits: 0,
+      created_at: now,
+      updated_at: now,
+    };
+    db.prepare(
+      `INSERT INTO escrow_jobs (
+         id, mode, payer_wallet_id, payee_wallet_id, amount_credits, description, status,
+         idempotency_key, fee_bps, fee_credits, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      job.id,
+      mode,
+      job.payer_wallet_id,
+      job.payee_wallet_id,
+      job.amount_credits,
+      job.description,
+      job.status,
+      job.idempotency_key,
+      job.fee_bps,
+      job.fee_credits,
+      job.created_at,
+      job.updated_at,
+    );
+    return {
+      ok: true,
+      job,
+      replay: false,
+      payer_balance_credits: payer.balance_credits - input.amountCredits,
+      payee_balance_credits: payee.balance_credits,
+    };
+  }
+
+  function settle(
+    id: string,
+    next: "released" | "refunded",
+    apply: (job: JobRow) => { feeBps: number; feeCredits: number; creditWalletId: string; credit: number },
+  ): SettleJobResult {
+    const job = selectJob("id = ? AND mode = ?", id, mode);
+    if (!job) return { ok: false, code: "not_found" };
+    if (job.status !== "held") return { ok: false, code: "not_held", status: job.status };
+    const payer = findWalletById(job.payer_wallet_id);
+    const payee = findWalletById(job.payee_wallet_id);
+    if (!payer || !payee) return { ok: false, code: "not_found" };
+    const effect = apply(job);
+    const now = new Date().toISOString();
+    const updated = db
+      .prepare(
+        `UPDATE escrow_jobs
+         SET status = ?, fee_bps = ?, fee_credits = ?, updated_at = ?
+         WHERE id = ? AND mode = ? AND status = 'held'`,
+      )
+      .run(next, effect.feeBps, effect.feeCredits, now, id, mode);
+    if (updated.changes !== 1) {
+      const again = selectJob("id = ? AND mode = ?", id, mode);
+      return { ok: false, code: "not_held", status: again?.status ?? job.status };
+    }
+    const credited = db
+      .prepare("UPDATE wallets SET balance_credits = balance_credits + ? WHERE id = ? AND mode = ?")
+      .run(effect.credit, effect.creditWalletId, mode);
+    if (credited.changes !== 1) throw new Error(`Escrow credit missed wallet ${effect.creditWalletId}`);
+    const saved = selectJob("id = ? AND mode = ?", id, mode);
+    if (!saved) throw new Error(`Escrow job disappeared: ${id}`);
+    return { ok: true, job: saved, ...walletBalances(saved.payer_wallet_id, saved.payee_wallet_id) };
+  }
 
   return store;
 }

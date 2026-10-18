@@ -1,7 +1,13 @@
 import { Readable } from "node:stream";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { catalogDocument, findProduct } from "./catalog.js";
-import { openStore, type Store, type WalletRow } from "./db.js";
+import { openStore, type JobRow, type SettleJobResult, type Store, type WalletRow } from "./db.js";
+import {
+  ESCROW_AMOUNT_MAX,
+  ESCROW_DESCRIPTION_MAX,
+  ESCROW_IDEMPOTENCY_MAX,
+  readEscrowFeeBps,
+} from "./escrow.js";
 import { ApiError } from "./errors.js";
 import { renderLanding, type LandingQuery } from "./landing.js";
 import { mountMcp } from "./mcp.js";
@@ -28,6 +34,8 @@ export type BuildOptions = {
   logger?: boolean;
   /** Omit to read Stripe settings from the environment. */
   stripe?: ResolvedStripe;
+  /** Overrides `ESCROW_FEE_BPS`. Basis points withheld from the payee on release. Default 0. */
+  escrowFeeBps?: number;
 };
 
 const MAX_TOPUP = 1_000_000;
@@ -63,6 +71,25 @@ function readCredits(body: Record<string, unknown>, min: number, max: number): n
   return credits;
 }
 
+function readBoundedString(value: unknown, field: string, max: number): string {
+  if (typeof value !== "string") {
+    throw new ApiError(400, "bad_request", `${field} must be a string of 1 to ${max} characters`);
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > max) {
+    throw new ApiError(400, "bad_request", `${field} must be a string of 1 to ${max} characters`);
+  }
+  return trimmed;
+}
+
+function readAmountCredits(body: Record<string, unknown>): number {
+  const amount = body.amount_credits;
+  if (typeof amount !== "number" || !Number.isInteger(amount) || amount < 1 || amount > ESCROW_AMOUNT_MAX) {
+    throw new ApiError(400, "bad_request", `amount_credits must be an integer from 1 to ${ESCROW_AMOUNT_MAX}`);
+  }
+  return amount;
+}
+
 function readSku(body: Record<string, unknown>): string {
   if (typeof body.sku !== "string" || body.sku.trim().length === 0 || body.sku.length > 80) {
     throw new ApiError(400, "bad_request", "sku must be a non-empty string");
@@ -84,6 +111,30 @@ async function bearerWallet(store: Store, request: FastifyRequest): Promise<Wall
     throw new ApiError(401, "unauthorized", "Invalid API key");
   }
   return wallet;
+}
+
+function publicJob(
+  job: JobRow,
+  balances: { payer_balance_credits: number; payee_balance_credits: number },
+  replay: boolean,
+) {
+  return {
+    job_id: job.id,
+    status: job.status,
+    payer_wallet_id: job.payer_wallet_id,
+    payee_wallet_id: job.payee_wallet_id,
+    amount_credits: job.amount_credits,
+    fee_bps: job.fee_bps,
+    fee_credits: job.fee_credits,
+    payee_credits: job.status === "released" ? job.amount_credits - job.fee_credits : 0,
+    description: job.description,
+    idempotency_key: job.idempotency_key,
+    created_at: job.created_at,
+    updated_at: job.updated_at,
+    payer_balance_credits: balances.payer_balance_credits,
+    payee_balance_credits: balances.payee_balance_credits,
+    ...(replay ? { idempotent_replay: true } : {}),
+  };
 }
 
 function publicPurchase(
@@ -186,6 +237,7 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
   const app = Fastify({ logger: options.logger ?? false });
   const stripe = options.stripe ?? stripeFromEnv();
   const mode = options.mode ?? stripe.mode;
+  const escrowFeeBps = readEscrowFeeBps(process.env.ESCROW_FEE_BPS, options.escrowFeeBps);
   const store = await openStore({
     databaseUrl: options.databaseUrl,
     sqlitePath: options.sqlitePath ?? ":memory:",
@@ -434,6 +486,97 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
       );
     }
     return reply.status(201).send(publicPurchase(result.purchase, result.balance_credits));
+  });
+
+  async function partyJob(request: FastifyRequest, id: string): Promise<{ wallet: WalletRow; job: JobRow }> {
+    const wallet = await bearerWallet(store, request);
+    const job = await store.getJob(id);
+    if (!job || (job.payer_wallet_id !== wallet.id && job.payee_wallet_id !== wallet.id)) {
+      throw new ApiError(404, "not_found", "Job not found");
+    }
+    return { wallet, job };
+  }
+
+  function settled(result: SettleJobResult, verb: "released" | "refunded"): Extract<SettleJobResult, { ok: true }> {
+    if (result.ok) return result;
+    if (result.code === "not_found") throw new ApiError(404, "not_found", "Job not found");
+    throw new ApiError(409, "job_not_held", `Job is ${result.status}. Only a held job can be ${verb}.`);
+  }
+
+  app.post("/v1/jobs", async (request, reply) => {
+    const payer = await bearerWallet(store, request);
+    const body = asRecord(request.body);
+    rejectUnknown(body, ["payee_wallet_id", "amount_credits", "description", "idempotency_key"]);
+    const payeeWalletId = readBoundedString(body.payee_wallet_id, "payee_wallet_id", 80);
+    const amountCredits = readAmountCredits(body);
+    const description = readBoundedString(body.description, "description", ESCROW_DESCRIPTION_MAX);
+    const idempotencyKey = readBoundedString(body.idempotency_key, "idempotency_key", ESCROW_IDEMPOTENCY_MAX);
+    if (payeeWalletId === payer.id) {
+      throw new ApiError(400, "bad_request", "Payer and payee must be different wallets");
+    }
+    const result = await store.createJob({
+      payerWalletId: payer.id,
+      payeeWalletId,
+      amountCredits,
+      description,
+      idempotencyKey,
+    });
+    if (!result.ok) {
+      if (result.code === "insufficient_credits") {
+        throw new ApiError(402, "insufficient_credits", `Need ${amountCredits} credits, wallet has ${result.balance_credits}.`);
+      }
+      if (result.code === "wallet_not_found") {
+        throw new ApiError(404, "not_found", result.which === "payer" ? "Payer wallet not found" : "Payee wallet not found");
+      }
+      if (result.code === "same_wallet") {
+        throw new ApiError(400, "bad_request", "Payer and payee must be different wallets");
+      }
+      if (result.code === "invalid_amount") {
+        throw new ApiError(400, "bad_request", `amount_credits must be an integer from 1 to ${ESCROW_AMOUNT_MAX}`);
+      }
+      throw new ApiError(
+        409,
+        "idempotency_conflict",
+        `Idempotency key already used for job ${result.job.id} with different parameters.`,
+      );
+    }
+    return reply.status(result.replay ? 200 : 201).send(publicJob(result.job, result, result.replay));
+  });
+
+  app.get("/v1/jobs/:id", async (request) => {
+    const { id } = request.params as { id: string };
+    const { job } = await partyJob(request, id);
+    const payer = await store.findWalletById(job.payer_wallet_id);
+    const payee = await store.findWalletById(job.payee_wallet_id);
+    return publicJob(
+      job,
+      {
+        payer_balance_credits: payer?.balance_credits ?? 0,
+        payee_balance_credits: payee?.balance_credits ?? 0,
+      },
+      false,
+    );
+  });
+
+  app.post("/v1/jobs/:id/release", async (request) => {
+    const { id } = request.params as { id: string };
+    const body = asRecord(request.body);
+    rejectUnknown(body, []);
+    const { wallet, job } = await partyJob(request, id);
+    if (wallet.id !== job.payer_wallet_id) {
+      throw new ApiError(403, "forbidden", "Only the payer can release a held job.");
+    }
+    const result = settled(await store.releaseJob(id, escrowFeeBps), "released");
+    return publicJob(result.job, result, false);
+  });
+
+  app.post("/v1/jobs/:id/refund", async (request) => {
+    const { id } = request.params as { id: string };
+    const body = asRecord(request.body);
+    rejectUnknown(body, []);
+    await partyJob(request, id);
+    const result = settled(await store.refundJob(id), "refunded");
+    return publicJob(result.job, result, false);
   });
 
   app.get("/v1/purchases/:id", async (request) => {
