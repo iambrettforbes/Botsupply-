@@ -54,7 +54,20 @@ test("MCP tools list the live catalog and do not invent a reservation tool", asy
   try {
     const listed = await rpc(app, "tools/list", {});
     const names = (listed.result?.tools ?? []).map((tool) => tool.name).sort();
-    assert.deepEqual(names, ["create_checkout", "get_balance", "list_catalog", "open_wallet", "purchase"]);
+    assert.deepEqual(names, [
+      "create_checkout",
+      "create_job",
+      "get_balance",
+      "get_job",
+      "list_catalog",
+      "open_wallet",
+      "purchase",
+      "refund_job",
+      "release_job",
+    ]);
+    const createJob = listed.result?.tools?.find((tool) => tool.name === "create_job");
+    assert.match(createJob?.description ?? "", /Hold credits in escrow/i);
+    assert.match(createJob?.description ?? "", /release when the work is delivered, refund if not/i);
     const purchase = listed.result?.tools?.find((tool) => tool.name === "purchase");
     assert.match(purchase?.description ?? "", /does not place a reservation/i);
     assert.match(purchase?.description ?? "", /sku/);

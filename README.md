@@ -39,7 +39,7 @@ Open [http://127.0.0.1:4317](http://127.0.0.1:4317) for the price sheet and curl
 
 ## Data
 
-When `DATABASE_URL` is set, wallets, purchases, checkout sessions, and credited Checkout sessions are stored in Postgres. Each row is tagged `dev`, `test`, or `live` from the Stripe secret key prefix (`sk_test_` / `rk_test_` → test, `sk_live_` / `rk_live_` → live, unset → dev). Every lookup includes that tag, so a test-mode process does not read live rows. The webhook accepts `checkout.session.completed` only when the event's `livemode` matches that tag.
+When `DATABASE_URL` is set, wallets, purchases, checkout sessions, credited Checkout sessions, and escrow jobs are stored in Postgres. Each row is tagged `dev`, `test`, or `live` from the Stripe secret key prefix (`sk_test_` / `rk_test_` → test, `sk_live_` / `rk_live_` → live, unset → dev). Every lookup includes that tag, so a test-mode process does not read live rows. The webhook accepts `checkout.session.completed` only when the event's `livemode` matches that tag.
 
 When `DATABASE_URL` is unset, the same records stay in a SQLite file:
 
@@ -116,9 +116,24 @@ Lists SKUs, credit prices, and the intended retail rate. Product payloads are no
 
 Requires `Authorization: Bearer <api_key>`. Returns `wallet_id`, `balance_credits`, `label`, and `created_at`. The API key is not included.
 
-### MCP
+### Escrow jobs
 
-`POST /mcp` is a stateless Streamable HTTP MCP server on this same process. The tools call the routes above (`list_catalog`, `open_wallet`, `get_balance`, `purchase`, `create_checkout`). Install steps and auth: [MCP_INSTALL.md](MCP_INSTALL.md).
+One agent can hold credits for another agent. `POST /v1/jobs` debits the authenticated payer and marks the job `held`. `POST /v1/jobs/:id/release` pays the payee. `POST /v1/jobs/:id/refund` returns the hold to the payer. Each of those writes runs in one database transaction.
+
+The bearer token is the payer on create. Release requires the payer's API key. Refund accepts the payer's key or the payee's key (the payee can cancel). `GET /v1/jobs/:id` requires the payer or the payee. A wallet from another Stripe mode is not a party, and a job created in one mode is invisible in the others.
+
+```bash
+curl -s -X POST http://127.0.0.1:4317/v1/jobs \
+  -H "authorization: Bearer $PAYER_API_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"payee_wallet_id":"wal_…","amount_credits":100,"description":"Deliver the brief","idempotency_key":"job-1"}'
+```
+
+`amount_credits` is an integer from 1 to 1000000000. The payer and payee must be different wallets in the same mode, and the payer must have the credits. `idempotency_key` is unique per payer and mode (1 to 128 characters). The same key and the same parameters return the original job and do not debit again. The same key with different parameters returns **409** `idempotency_conflict`.
+
+Release and refund move credits only while the status is `held`. A second release, a release after refund, or a refund after release returns **409** `job_not_held` and does not move credits. Insufficient balance returns **402** and does not create a job.
+
+`ESCROW_FEE_BPS` is an optional integer from 0 to 10000 (100 bps = 1%). The default is 0. On release the fee is `floor(amount_credits * ESCROW_FEE_BPS / 10000)`, recorded on the job as `fee_bps` and `fee_credits`, and credited to nobody. The payee receives `payee_credits` (`amount_credits - fee_credits`). Refunds return the full hold and charge no fee. While the job is held, `fee_credits` and `payee_credits` are 0.
 
 ### `POST /v1/purchase`
 
@@ -137,6 +152,10 @@ Insufficient balance returns **402** and does not deduct credits. An unknown SKU
 
 Replays a purchase for the wallet that owns it. Same bearer token as purchase.
 
+### MCP
+
+`POST /mcp` is a stateless Streamable HTTP MCP server on this same process. The tools call the routes above (`list_catalog`, `open_wallet`, `get_balance`, `purchase`, `create_checkout`, `create_job`, `get_job`, `release_job`, `refund_job`). Install steps and auth: [MCP_INSTALL.md](MCP_INSTALL.md).
+
 ### `GET /health`
 
 ```json
@@ -151,7 +170,7 @@ Replays a purchase for the wallet that owns it. Same bearer token as purchase.
 npm test
 ```
 
-Covers wallet creation, the DEV top-up, a purchase of each SKU, credit deduction, and idempotent Stripe credit application. Checkout tests use a fake Stripe client and do not call the network.
+Covers wallet creation, the DEV top-up, a purchase of each SKU, credit deduction, idempotent Stripe credit application, and escrow hold, release, refund, fee, idempotency, and mode isolation. Checkout tests use a fake Stripe client and do not call the network.
 
 ## Deploy
 

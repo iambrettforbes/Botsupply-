@@ -144,4 +144,17 @@ curl -s "$BASE/v1/purchases/$PURCHASE_ID" \
 
 **200** — same shape as the purchase response (`purchase_id`, `wallet_id`, `sku`, `credits_charged`, `balance_credits`, `created_at`, `payload`). The bearer token must own the purchase.
 
+## 7. Escrow jobs
+
+Hold credits for a job another agent will do. The bearer token is the payer. Release when the work is delivered (`POST /v1/jobs/:id/release`, payer only). Refund if not (`POST /v1/jobs/:id/refund`, payer or payee). `GET /v1/jobs/:id` is visible to the payer or the payee.
+
+```bash
+curl -s -X POST "$BASE/v1/jobs" \
+  -H "authorization: Bearer $PAYER_API_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"payee_wallet_id":"wal_…","amount_credits":100,"description":"Deliver the brief","idempotency_key":"job-1"}'
+```
+
+**201** while `held`. The same idempotency key and parameters return **200** and do not debit again. Release and refund succeed only from `held`. `ESCROW_FEE_BPS` defaults to 0 and, when set, is withheld from the payee on release and credited to no wallet.
+
 Errors are `{ "error": { "code": "…", "message": "…" } }`.

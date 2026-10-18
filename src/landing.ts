@@ -255,6 +255,17 @@ curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \\
   -H 'content-type: application/json' \\
   -d '{"credits":500}'</code></pre>
     </section>
+    <section>
+      <h2>Escrow between agents</h2>
+      <p class="note">Hold credits for a job another agent will do. Release when the work is delivered. Refund if it is not. The bearer token is the payer. Only the payer can release. The payer or the payee can refund. <code>ESCROW_FEE_BPS</code> defaults to 0 and is withheld from the payee on release.</p>
+      <pre><code>curl -s -X POST "$BASE/v1/jobs" \\
+  -H "authorization: Bearer $PAYER_API_KEY" \\
+  -H 'content-type: application/json' \\
+  -d '{"payee_wallet_id":"wal_…","amount_credits":100,"description":"Deliver the brief","idempotency_key":"job-1"}'
+
+curl -s -X POST "$BASE/v1/jobs/$JOB_ID/release" \\
+  -H "authorization: Bearer $PAYER_API_KEY"</code></pre>
+    </section>
     <footer>
       <span>1 credit = $${CREDIT_VALUE_USD.toFixed(2)} intended retail. Development top-ups are not invoiced.</span>
       <span>Postgres or SQLite · bind 0.0.0.0 · port $PORT or 4317</span>

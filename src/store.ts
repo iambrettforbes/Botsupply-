@@ -55,8 +55,52 @@ export type StripeCreditInput = {
   credits: number;
 };
 
+export type JobStatus = "held" | "released" | "refunded";
+
+export type JobRow = {
+  id: string;
+  payer_wallet_id: string;
+  payee_wallet_id: string;
+  amount_credits: number;
+  description: string;
+  status: JobStatus;
+  idempotency_key: string;
+  /** Basis points applied when the job was released. 0 while held or refunded. */
+  fee_bps: number;
+  /** Credits withheld from the payee on release. Not credited to any wallet. */
+  fee_credits: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type CreateJobInput = {
+  payerWalletId: string;
+  payeeWalletId: string;
+  amountCredits: number;
+  description: string;
+  idempotencyKey: string;
+};
+
+export type JobBalances = {
+  payer_balance_credits: number;
+  payee_balance_credits: number;
+};
+
+export type CreateJobResult =
+  | ({ ok: true; job: JobRow; replay: boolean } & JobBalances)
+  | { ok: false; code: "insufficient_credits"; balance_credits: number }
+  | { ok: false; code: "wallet_not_found"; which: "payer" | "payee" }
+  | { ok: false; code: "same_wallet" }
+  | { ok: false; code: "invalid_amount" }
+  | { ok: false; code: "idempotency_conflict"; job: JobRow };
+
+export type SettleJobResult =
+  | ({ ok: true; job: JobRow } & JobBalances)
+  | { ok: false; code: "not_found" }
+  | { ok: false; code: "not_held"; status: JobStatus };
+
 /**
- * Persistence for wallets, purchases, and Checkout rows.
+ * Persistence for wallets, purchases, Checkout rows, and escrow jobs.
  * Every read and write is limited to `mode` (dev, test, or live).
  */
 export type Store = {
@@ -78,6 +122,17 @@ export type Store = {
   saveCheckoutSessionUrl(input: CheckoutSessionSave): Promise<void>;
   findCheckoutSessionUrl(sessionId: string): Promise<CheckoutSessionRow | undefined>;
   applyStripeCheckoutCredit(input: StripeCreditInput): Promise<ApplyStripeCreditResult>;
+  /**
+   * Debit the payer and insert a held job. Idempotency keys are unique per mode and payer.
+   * A repeat with the same parameters returns the existing job and does not debit again.
+   */
+  createJob(input: CreateJobInput): Promise<CreateJobResult>;
+  /** Job in this store's mode, or undefined when the id is missing or belongs to another mode. */
+  getJob(id: string): Promise<JobRow | undefined>;
+  /** Credit the payee from a held job. `feeBps` is withheld from the payee and recorded on the job. */
+  releaseJob(id: string, feeBps: number): Promise<SettleJobResult>;
+  /** Return the full held amount to the payer. */
+  refundJob(id: string): Promise<SettleJobResult>;
 };
 
 export function hashApiKey(apiKey: string): string {
@@ -106,6 +161,61 @@ export function mapWallet(row: {
     label: row.label,
     created_at: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
   };
+}
+
+export function mapJob(row: {
+  id: string;
+  payer_wallet_id: string;
+  payee_wallet_id: string;
+  amount_credits: number | string;
+  description: string;
+  status: string;
+  idempotency_key: string;
+  fee_bps: number | string;
+  fee_credits: number | string;
+  created_at: string | Date;
+  updated_at: string | Date;
+}): JobRow {
+  const status = row.status;
+  if (status !== "held" && status !== "released" && status !== "refunded") {
+    throw new Error(`Unexpected job status: ${status}`);
+  }
+  const created = row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at;
+  const updated = row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at;
+  return {
+    id: row.id,
+    payer_wallet_id: row.payer_wallet_id,
+    payee_wallet_id: row.payee_wallet_id,
+    amount_credits: Number(row.amount_credits),
+    description: row.description,
+    status,
+    idempotency_key: row.idempotency_key,
+    fee_bps: Number(row.fee_bps),
+    fee_credits: Number(row.fee_credits),
+    created_at: created,
+    updated_at: updated,
+  };
+}
+
+export function sameJobRequest(job: JobRow, input: CreateJobInput): boolean {
+  return (
+    job.payer_wallet_id === input.payerWalletId &&
+    job.payee_wallet_id === input.payeeWalletId &&
+    job.amount_credits === input.amountCredits &&
+    job.description === input.description &&
+    job.idempotency_key === input.idempotencyKey
+  );
+}
+
+/** Lock the lower wallet id first so opposite-direction jobs cannot deadlock. */
+export function lockWalletIds(left: string, right: string): [string, string] {
+  return left < right ? [left, right] : [right, left];
+}
+
+export function isUniqueConstraint(error: unknown): boolean {
+  if (typeof error !== "object" || error == null || !("code" in error)) return false;
+  const code = String((error as { code: unknown }).code);
+  return code === "SQLITE_CONSTRAINT_UNIQUE" || code === "23505";
 }
 
 export function mapPurchase(row: {

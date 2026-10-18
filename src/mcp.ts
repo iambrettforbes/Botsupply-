@@ -1,5 +1,6 @@
 import { createMcpHandler, fromJsonSchema, McpServer, type AuthInfo } from "@modelcontextprotocol/server";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { ESCROW_AMOUNT_MAX, ESCROW_DESCRIPTION_MAX, ESCROW_IDEMPOTENCY_MAX } from "./escrow.js";
 import { CHECKOUT_MAX_CREDITS, CHECKOUT_MIN_CREDITS } from "./stripe.js";
 
 const SERVER_NAME = "botsupply";
@@ -11,6 +12,7 @@ const INSTRUCTIONS = [
   "recipe.book-table is recipe documentation only. Buying it does not place a reservation.",
   "Auth is a wallet API key: Authorization: Bearer on the MCP connection, or the api_key tool argument returned once by open_wallet.",
   "Credits are prepaid. create_checkout returns a Stripe Checkout URL when that route is configured. This server does not mint credits.",
+  "create_job holds the caller's credits in escrow for another agent's wallet. release_job pays the payee when the work is delivered. refund_job returns the hold to the payer. The payer authorizes release and refund. The payee can also refund to cancel. A platform fee, ESCROW_FEE_BPS, defaults to 0 and is withheld from the payee only on release.",
 ].join(" ");
 
 export type ApiResult = {
@@ -70,6 +72,52 @@ const purchaseSchema = fromJsonSchema<{ sku: string; api_key?: string }>({
     api_key: apiKeySchema,
   },
   required: ["sku"],
+  additionalProperties: false,
+});
+
+const createJobSchema = fromJsonSchema<{
+  payee_wallet_id: string;
+  amount_credits: number;
+  description: string;
+  idempotency_key: string;
+  api_key?: string;
+}>({
+  type: "object",
+  properties: {
+    payee_wallet_id: {
+      type: "string",
+      description: "Wallet that receives the credits when the payer releases the job.",
+    },
+    amount_credits: {
+      type: "integer",
+      minimum: 1,
+      maximum: ESCROW_AMOUNT_MAX,
+      description: "Credits to debit from the authenticated payer wallet and hold until release or refund.",
+    },
+    description: {
+      type: "string",
+      maxLength: ESCROW_DESCRIPTION_MAX,
+      description: "What the payee is being paid to do.",
+    },
+    idempotency_key: {
+      type: "string",
+      maxLength: ESCROW_IDEMPOTENCY_MAX,
+      description:
+        "Caller-chosen key scoped to the payer. A retry with the same key and the same parameters returns the original job and does not debit again.",
+    },
+    api_key: apiKeySchema,
+  },
+  required: ["payee_wallet_id", "amount_credits", "description", "idempotency_key"],
+  additionalProperties: false,
+});
+
+const jobIdSchema = fromJsonSchema<{ job_id: string; api_key?: string }>({
+  type: "object",
+  properties: {
+    job_id: { type: "string", description: "Escrow job id returned by create_job (job_…)." },
+    api_key: apiKeySchema,
+  },
+  required: ["job_id"],
   additionalProperties: false,
 });
 
@@ -243,6 +291,81 @@ function registerTools(server: McpServer, client: BotSupplyClient, defaultApiKey
       return fromApi(
         await client.post(`/v1/wallets/${encodeURIComponent(walletId)}/checkout`, { credits: args.credits }, apiKey),
       );
+    },
+  );
+
+  server.registerTool(
+    "create_job",
+    {
+      title: "Create escrow job",
+      description:
+        "Hold credits in escrow for a job another agent will do; release when the work is delivered, refund if not. Debits amount_credits from the authenticated payer wallet and marks the job held. payee_wallet_id receives the credits on release. Rejects amount_credits below 1, a payer equal to the payee, a missing or other-mode payee wallet, and insufficient balance. idempotency_key makes a retry return the same job without debiting twice. Same as POST /v1/jobs.",
+      inputSchema: createJobSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (args) => {
+      const apiKey = resolveApiKey(args.api_key, defaultApiKey);
+      if (!apiKey) return missingKey();
+      return fromApi(
+        await client.post(
+          "/v1/jobs",
+          {
+            payee_wallet_id: args.payee_wallet_id,
+            amount_credits: args.amount_credits,
+            description: args.description,
+            idempotency_key: args.idempotency_key,
+          },
+          apiKey,
+        ),
+      );
+    },
+  );
+
+  server.registerTool(
+    "get_job",
+    {
+      title: "Get escrow job",
+      description:
+        "Return an escrow job's status (held, released, or refunded), the held amount, any release fee, and the payer and payee wallets. The caller must be the payer or the payee. A job from another Stripe mode is not visible. Same as GET /v1/jobs/:id.",
+      inputSchema: jobIdSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (args) => {
+      const apiKey = resolveApiKey(args.api_key, defaultApiKey);
+      if (!apiKey) return missingKey();
+      return fromApi(await client.get(`/v1/jobs/${encodeURIComponent(args.job_id)}`, apiKey));
+    },
+  );
+
+  server.registerTool(
+    "release_job",
+    {
+      title: "Release escrow job",
+      description:
+        "Release held escrow credits to the payee when the work is delivered. Only the payer can release, and only while the job is held. ESCROW_FEE_BPS (default 0) is withheld on release, recorded on the job, and credited to nobody; the payee receives amount_credits minus that fee. Releasing twice, or releasing after a refund, is rejected and does not move credits again. Same as POST /v1/jobs/:id/release.",
+      inputSchema: jobIdSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async (args) => {
+      const apiKey = resolveApiKey(args.api_key, defaultApiKey);
+      if (!apiKey) return missingKey();
+      return fromApi(await client.post(`/v1/jobs/${encodeURIComponent(args.job_id)}/release`, {}, apiKey));
+    },
+  );
+
+  server.registerTool(
+    "refund_job",
+    {
+      title: "Refund escrow job",
+      description:
+        "Return held escrow credits to the payer when the work is not delivered or the job is cancelled. The payer or the payee can refund, and only while the job is held. The full hold goes back to the payer; no platform fee is taken. Refunding twice, or refunding after release, is rejected and does not move credits again. Same as POST /v1/jobs/:id/refund.",
+      inputSchema: jobIdSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async (args) => {
+      const apiKey = resolveApiKey(args.api_key, defaultApiKey);
+      if (!apiKey) return missingKey();
+      return fromApi(await client.post(`/v1/jobs/${encodeURIComponent(args.job_id)}/refund`, {}, apiKey));
     },
   );
 }

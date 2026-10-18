@@ -15,8 +15,14 @@ HTTP API notes: [AGENT_INSTALL.md](AGENT_INSTALL.md).
 | `get_balance` | `GET /v1/balance` | Bearer API key |
 | `purchase` | `POST /v1/purchase` with `{ "sku" }` | Bearer API key |
 | `create_checkout` | `POST /v1/wallets/:id/checkout` with `{ "credits" }` | Bearer API key |
+| `create_job` | `POST /v1/jobs` | Bearer API key (payer) |
+| `get_job` | `GET /v1/jobs/:id` | Bearer API key (payer or payee) |
+| `release_job` | `POST /v1/jobs/:id/release` | Bearer API key (payer only) |
+| `refund_job` | `POST /v1/jobs/:id/refund` | Bearer API key (payer or payee) |
 
 `open_wallet` creates a new wallet and returns `api_key` once. It does not look up a wallet you already have. Purchase sends `sku`, not `sku_id`.
+
+`create_job` holds credits in escrow for a job another agent will do; release when the work is delivered, refund if not. The authenticated wallet is the payer. Arguments are `payee_wallet_id`, `amount_credits` (integer from 1), `description`, and `idempotency_key`. A retry with the same key and the same parameters returns the original job and does not debit again. `release_job` pays the payee and only the payer can call it. `refund_job` returns the hold to the payer; the payee can call it to cancel. Both settle only while the job is `held`. `ESCROW_FEE_BPS` (default 0) is withheld from the payee on release, recorded on the job, and credited to no wallet. Jobs are scoped to the service's Stripe mode.
 
 `recipe.book-table` is recipe documentation. Buying it does not place a reservation. The buying agent runs the recipe itself.
 
@@ -27,7 +33,7 @@ HTTP API notes: [AGENT_INSTALL.md](AGENT_INSTALL.md).
 The hosted server reads the key from the MCP request, not from the Render environment.
 
 1. `Authorization: Bearer <api_key>` on the MCP client connection. Prefer this.
-2. Or the `api_key` argument on `get_balance`, `purchase`, and `create_checkout` (useful right after `open_wallet`, before you update the client header).
+2. Or the `api_key` argument on `get_balance`, `purchase`, `create_checkout`, `create_job`, `get_job`, `release_job`, and `refund_job` (useful right after `open_wallet`, before you update the client header).
 
 `BOTSUPPLY_API_KEY` is read only by the local stdio process below. The hosted server ignores it.
 
@@ -111,6 +117,7 @@ Then call `open_wallet`, save `api_key`, and call `get_balance`.
 - Live SKUs are whatever `GET /v1/catalog` returns. Today that is `pack.venue-hours` (20), `pack.competitor-snapshot` (50), and `recipe.book-table` (100).
 - 1 credit = $0.01 USD. Checkout `credits` is an integer from 500 to 100000. The minimum top-up is $5.
 - Each `purchase` charges again. It is not idempotent.
+- `create_job` is idempotent for the same payer, `idempotency_key`, and parameters. Release and refund are not retries: a second call returns `job_not_held` and does not move credits.
 - Render's free web service sleeps after about 15 minutes idle. Retry `GET /health` until it returns `"status":"ok"`.
-- With `DATABASE_URL` set, wallets, credits, and purchases persist in Postgres and are scoped to the Stripe mode (`dev`, `test`, or `live`). Without it, SQLite is on an ephemeral disk and resets on deploy, restart, or spin-down.
+- With `DATABASE_URL` set, wallets, credits, purchases, and escrow jobs persist in Postgres and are scoped to the Stripe mode (`dev`, `test`, or `live`). Without it, SQLite is on an ephemeral disk and resets on deploy, restart, or spin-down.
 - This server does not place reservations, scrape sites, or sell anything that is not in the catalog.

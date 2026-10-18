@@ -1,15 +1,25 @@
 import { Pool, type PoolClient } from "pg";
+import { clampFeeBps, escrowFeeCredits } from "./escrow.js";
 import type { StripeMode } from "./stripe.js";
 import {
   hashApiKey,
+  isUniqueConstraint,
+  lockWalletIds,
+  mapJob,
   mapPurchase,
   mapWallet,
   newApiKey,
   newId,
+  sameJobRequest,
   type ApplyStripeCreditResult,
   type CheckoutSessionRow,
   type CheckoutSessionSave,
+  type CreateJobInput,
+  type CreateJobResult,
+  type JobBalances,
+  type JobRow,
   type PurchaseResult,
+  type SettleJobResult,
   type Store,
   type StripeCreditInput,
   type WalletRow,
@@ -51,7 +61,26 @@ const SCHEMA = [
     created_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_wallets_mode_hash ON wallets (mode, api_key_hash)`,
+  `CREATE TABLE IF NOT EXISTS escrow_jobs (
+    id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    payer_wallet_id TEXT NOT NULL REFERENCES wallets(id),
+    payee_wallet_id TEXT NOT NULL REFERENCES wallets(id),
+    amount_credits INTEGER NOT NULL,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('held', 'released', 'refunded')),
+    idempotency_key TEXT NOT NULL,
+    fee_bps INTEGER NOT NULL DEFAULT 0,
+    fee_credits INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (mode, payer_wallet_id, idempotency_key)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_escrow_jobs_mode_payer ON escrow_jobs (mode, payer_wallet_id)`,
 ];
+
+const JOB_COLUMNS =
+  "id, payer_wallet_id, payee_wallet_id, amount_credits, description, status, idempotency_key, fee_bps, fee_credits, created_at, updated_at";
 
 const WALLET_COLUMNS = "id, api_key_hash, balance_credits, label, created_at";
 
@@ -130,6 +159,73 @@ export async function openPostgresStore(connectionString: string, mode: StripeMo
       credits: Number(row.credits),
       session_id: row.session_id,
     };
+  }
+
+  async function selectJob(client: Pool | PoolClient, whereSql: string, params: unknown[]): Promise<JobRow | undefined> {
+    const result = await client.query(`SELECT ${JOB_COLUMNS} FROM escrow_jobs WHERE ${whereSql}`, params);
+    const row = result.rows[0] as Parameters<typeof mapJob>[0] | undefined;
+    return row ? mapJob(row) : undefined;
+  }
+
+  async function lockWallet(client: PoolClient, id: string): Promise<WalletRow | undefined> {
+    const result = await client.query(
+      `SELECT ${WALLET_COLUMNS} FROM wallets WHERE id = $1 AND mode = $2 FOR UPDATE`,
+      [id, mode],
+    );
+    const row = result.rows[0] as WalletRow | undefined;
+    return row ? mapWallet(row) : undefined;
+  }
+
+  async function jobBalances(client: Pool | PoolClient, payerId: string, payeeId: string): Promise<JobBalances> {
+    const payer = await findWalletById(payerId, client);
+    const payee = await findWalletById(payeeId, client);
+    return {
+      payer_balance_credits: payer?.balance_credits ?? 0,
+      payee_balance_credits: payee?.balance_credits ?? 0,
+    };
+  }
+
+  function replayCreate(input: CreateJobInput, job: JobRow, balances: JobBalances): CreateJobResult {
+    if (!sameJobRequest(job, input)) return { ok: false, code: "idempotency_conflict", job };
+    return { ok: true, job, replay: true, ...balances };
+  }
+
+  async function settleJob(
+    client: PoolClient,
+    id: string,
+    next: "released" | "refunded",
+    apply: (job: JobRow) => { feeBps: number; feeCredits: number; creditWalletId: string; credit: number },
+  ): Promise<SettleJobResult> {
+    const locked = await client.query(
+      `SELECT ${JOB_COLUMNS} FROM escrow_jobs WHERE id = $1 AND mode = $2 FOR UPDATE`,
+      [id, mode],
+    );
+    const row = locked.rows[0] as Parameters<typeof mapJob>[0] | undefined;
+    if (!row) return { ok: false, code: "not_found" };
+    const job = mapJob(row);
+    if (job.status !== "held") return { ok: false, code: "not_held", status: job.status };
+    const [firstId, secondId] = lockWalletIds(job.payer_wallet_id, job.payee_wallet_id);
+    const first = await lockWallet(client, firstId);
+    const second = await lockWallet(client, secondId);
+    if (!first || !second) return { ok: false, code: "not_found" };
+    const effect = apply(job);
+    const now = new Date().toISOString();
+    const updated = await client.query(
+      `UPDATE escrow_jobs
+       SET status = $1, fee_bps = $2, fee_credits = $3, updated_at = $4
+       WHERE id = $5 AND mode = $6 AND status = 'held'
+       RETURNING ${JOB_COLUMNS}`,
+      [next, effect.feeBps, effect.feeCredits, now, id, mode],
+    );
+    const savedRow = updated.rows[0] as Parameters<typeof mapJob>[0] | undefined;
+    if (!savedRow) return { ok: false, code: "not_held", status: job.status };
+    const credited = await client.query(
+      `UPDATE wallets SET balance_credits = balance_credits + $1 WHERE id = $2 AND mode = $3`,
+      [effect.credit, effect.creditWalletId, mode],
+    );
+    if ((credited.rowCount ?? 0) !== 1) throw new Error(`Escrow credit missed wallet ${effect.creditWalletId}`);
+    const saved = mapJob(savedRow);
+    return { ok: true, job: saved, ...(await jobBalances(client, saved.payer_wallet_id, saved.payee_wallet_id)) };
   }
 
   const store: Store = {
@@ -283,6 +379,113 @@ export async function openPostgresStore(connectionString: string, mode: StripeMo
         if (replay) return replay;
         throw error;
       }
+    },
+    async createJob(input) {
+      if (!Number.isInteger(input.amountCredits) || input.amountCredits < 1) {
+        return { ok: false, code: "invalid_amount" };
+      }
+      if (input.payerWalletId === input.payeeWalletId) return { ok: false, code: "same_wallet" };
+      try {
+        return await withTransaction(pool, async (client) => {
+          const existing = await selectJob(client, "mode = $1 AND payer_wallet_id = $2 AND idempotency_key = $3", [
+            mode,
+            input.payerWalletId,
+            input.idempotencyKey,
+          ]);
+          if (existing) return replayCreate(input, existing, await jobBalances(client, existing.payer_wallet_id, existing.payee_wallet_id));
+          const [firstId, secondId] = lockWalletIds(input.payerWalletId, input.payeeWalletId);
+          const first = await lockWallet(client, firstId);
+          const second = await lockWallet(client, secondId);
+          const payer = first?.id === input.payerWalletId ? first : second?.id === input.payerWalletId ? second : undefined;
+          const payee = first?.id === input.payeeWalletId ? first : second?.id === input.payeeWalletId ? second : undefined;
+          if (!payer) return { ok: false, code: "wallet_not_found", which: "payer" };
+          if (!payee) return { ok: false, code: "wallet_not_found", which: "payee" };
+          const debited = await client.query(
+            `UPDATE wallets SET balance_credits = balance_credits - $1
+             WHERE id = $2 AND mode = $3 AND balance_credits >= $1`,
+            [input.amountCredits, input.payerWalletId, mode],
+          );
+          if ((debited.rowCount ?? 0) !== 1) {
+            return { ok: false, code: "insufficient_credits", balance_credits: payer.balance_credits };
+          }
+          const now = new Date().toISOString();
+          const job: JobRow = {
+            id: newId("job"),
+            payer_wallet_id: input.payerWalletId,
+            payee_wallet_id: input.payeeWalletId,
+            amount_credits: input.amountCredits,
+            description: input.description,
+            status: "held",
+            idempotency_key: input.idempotencyKey,
+            fee_bps: 0,
+            fee_credits: 0,
+            created_at: now,
+            updated_at: now,
+          };
+          await client.query(
+            `INSERT INTO escrow_jobs (
+               id, mode, payer_wallet_id, payee_wallet_id, amount_credits, description, status,
+               idempotency_key, fee_bps, fee_credits, created_at, updated_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+            [
+              job.id,
+              mode,
+              job.payer_wallet_id,
+              job.payee_wallet_id,
+              job.amount_credits,
+              job.description,
+              job.status,
+              job.idempotency_key,
+              job.fee_bps,
+              job.fee_credits,
+              job.created_at,
+              job.updated_at,
+            ],
+          );
+          return {
+            ok: true,
+            job,
+            replay: false,
+            payer_balance_credits: payer.balance_credits - input.amountCredits,
+            payee_balance_credits: payee.balance_credits,
+          };
+        });
+      } catch (error) {
+        if (!isUniqueConstraint(error)) throw error;
+        const existing = await selectJob(pool, "mode = $1 AND payer_wallet_id = $2 AND idempotency_key = $3", [
+          mode,
+          input.payerWalletId,
+          input.idempotencyKey,
+        ]);
+        if (!existing) throw error;
+        return replayCreate(input, existing, await jobBalances(pool, existing.payer_wallet_id, existing.payee_wallet_id));
+      }
+    },
+    async getJob(id) {
+      return selectJob(pool, "id = $1 AND mode = $2", [id, mode]);
+    },
+    async releaseJob(id, feeBps) {
+      return withTransaction(pool, (client) =>
+        settleJob(client, id, "released", (job) => {
+          const feeCredits = escrowFeeCredits(job.amount_credits, feeBps);
+          return {
+            feeBps: clampFeeBps(feeBps),
+            feeCredits,
+            creditWalletId: job.payee_wallet_id,
+            credit: job.amount_credits - feeCredits,
+          };
+        }),
+      );
+    },
+    async refundJob(id) {
+      return withTransaction(pool, (client) =>
+        settleJob(client, id, "refunded", (job) => ({
+          feeBps: 0,
+          feeCredits: 0,
+          creditWalletId: job.payer_wallet_id,
+          credit: job.amount_credits,
+        })),
+      );
     },
   };
 
