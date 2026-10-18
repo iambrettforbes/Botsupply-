@@ -44,7 +44,7 @@ When `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `PUBLIC_BASE_URL` are set
 
 Browser (new demo wallet, then Stripe Checkout):
 
-https://botsupply.onrender.com/v1/pay?credits=100
+https://botsupply.onrender.com/v1/pay?credits=500
 
 `?wallet_id=wal_…` pays into an existing wallet. The hosted Checkout URL includes a `#` fragment. Opening the session id without that fragment shows “This link is incomplete.” Use `/v1/pay` or the `url` from checkout; do not rebuild the Stripe link yourself.
 
@@ -55,10 +55,10 @@ curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \
   -d '{"credits":500}'
 ```
 
-`credits` is an integer from 100 to 100000. One credit is one US cent. Open the returned `url`. Stripe notifies `POST /v1/stripe/webhook` (`checkout.session.completed`, paid). The wallet is credited once per Checkout Session id.
+`credits` is an integer from 500 to 100000. The minimum top-up is $5. One credit is one US cent. Open the returned `url`. Stripe notifies `POST /v1/stripe/webhook` (`checkout.session.completed`, paid). The wallet is credited once per Checkout Session id. Events from the other Stripe mode are ignored.
 
 Operators add the three variables on the Render **botsupply** service under **Environment** (`PUBLIC_BASE_URL=https://botsupply.onrender.com`). The webhook endpoint is `https://botsupply.onrender.com/v1/stripe/webhook`. Do not put secret keys in the repo.
 
-The free Render service sleeps after idle time. The first request after a cold start can take about a minute; retry `/health` until it returns `{"status":"ok","service":"botsupply"}`.
+The free Render service sleeps after idle time. The first request after a cold start can take about a minute; retry `/health` until it returns `"status":"ok"`. A Postgres deploy reports `"storage":"postgres"` and the Stripe mode (`test` or `live`).
 
-SQLite lives on an ephemeral disk. Wallets, credits, and purchases disappear on deploy, restart, or spin-down. Open a new wallet after the service comes back.
+When `DATABASE_URL` is set, wallets, credits, and purchases stay in Postgres across deploys and restarts. Rows are tagged with the Stripe mode of the key in use, and a test key does not see live wallets. Without `DATABASE_URL`, SQLite lives on an ephemeral disk and resets on deploy, restart, or spin-down.

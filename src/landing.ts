@@ -1,4 +1,5 @@
 import { CREDIT_VALUE_USD, PRODUCTS, priceUsd, type Product } from "./catalog.js";
+import { CHECKOUT_MIN_CREDITS } from "./stripe.js";
 
 function esc(value: string): string {
   return value.replace(/[&<>"']/g, (char) => {
@@ -244,9 +245,9 @@ curl -s "$BASE/v1/purchases/$PURCHASE_ID" \\
     </section>
     <section>
       <h2>Pay with Stripe</h2>
-      <p class="note">When <code>STRIPE_SECRET_KEY</code>, <code>STRIPE_WEBHOOK_SECRET</code>, and <code>PUBLIC_BASE_URL</code> are set, Checkout is 1 cent per credit (minimum 100). Open the returned <code>url</code>. It redirects to hosted Checkout and keeps the fragment Stripe requires. A copied session id alone shows “This link is incomplete.” The webhook credits the wallet once.</p>
+      <p class="note">When <code>STRIPE_SECRET_KEY</code>, <code>STRIPE_WEBHOOK_SECRET</code>, and <code>PUBLIC_BASE_URL</code> are set, Checkout is 1 cent per credit (minimum ${CHECKOUT_MIN_CREDITS} credits, $5). Open the returned <code>url</code>. It redirects to hosted Checkout and keeps the fragment Stripe requires. A copied session id alone shows “This link is incomplete.” The webhook credits the wallet once.</p>
       <pre><code># Browser. New demo wallet, then redirect to Checkout.
-https://botsupply.onrender.com/v1/pay?credits=100
+https://botsupply.onrender.com/v1/pay?credits=${CHECKOUT_MIN_CREDITS}
 
 # API. Body field is credits. url is a short redirect, not a bare session id.
 curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \\
@@ -256,7 +257,7 @@ curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \\
     </section>
     <footer>
       <span>1 credit = $${CREDIT_VALUE_USD.toFixed(2)} intended retail. Development top-ups are not invoiced.</span>
-      <span>SQLite · bind 0.0.0.0 · port $PORT or 4317</span>
+      <span>Postgres or SQLite · bind 0.0.0.0 · port $PORT or 4317</span>
     </footer>
   </div>
 </body>

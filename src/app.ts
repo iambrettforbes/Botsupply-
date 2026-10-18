@@ -1,20 +1,7 @@
 import { Readable } from "node:stream";
-import type Database from "better-sqlite3";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { catalogDocument, findProduct } from "./catalog.js";
-import {
-  applyStripeCheckoutCredit,
-  createWallet,
-  findCheckoutSessionUrl,
-  findPurchase,
-  findWalletByApiKey,
-  findWalletById,
-  openDatabase,
-  purchaseSku,
-  saveCheckoutSessionUrl,
-  topUpWallet,
-  type WalletRow,
-} from "./db.js";
+import { openStore, type Store, type WalletRow } from "./db.js";
 import { ApiError } from "./errors.js";
 import { renderLanding, type LandingQuery } from "./landing.js";
 import { mountMcp } from "./mcp.js";
@@ -22,15 +9,22 @@ import {
   CHECKOUT_MAX_CREDITS,
   CHECKOUT_MIN_CREDITS,
   checkoutUrls,
+  eventMatchesStripeMode,
   hostedCheckoutUrl,
   stripeFromEnv,
   type CheckoutCompletedEvent,
   type ResolvedStripe,
   type StripeConfig,
+  type StripeMode,
 } from "./stripe.js";
 
 export type BuildOptions = {
-  sqlitePath: string;
+  /** SQLite file, or `:memory:`. Ignored when `databaseUrl` is set. */
+  sqlitePath?: string;
+  /** Postgres connection string. When set, this process does not open SQLite. */
+  databaseUrl?: string;
+  /** Overrides the mode derived from the Stripe secret. */
+  mode?: StripeMode;
   logger?: boolean;
   /** Omit to read Stripe settings from the environment. */
   stripe?: ResolvedStripe;
@@ -76,7 +70,7 @@ function readSku(body: Record<string, unknown>): string {
   return body.sku;
 }
 
-function bearerWallet(db: ReturnType<typeof openDatabase>, request: FastifyRequest): WalletRow {
+async function bearerWallet(store: Store, request: FastifyRequest): Promise<WalletRow> {
   const header = request.headers.authorization;
   if (!header) {
     throw new ApiError(401, "unauthorized", "Missing Authorization bearer token");
@@ -85,7 +79,7 @@ function bearerWallet(db: ReturnType<typeof openDatabase>, request: FastifyReque
   if (!match?.[1]) {
     throw new ApiError(401, "unauthorized", "Authorization must be a Bearer token");
   }
-  const wallet = findWalletByApiKey(db, match[1]);
+  const wallet = await store.findWalletByApiKey(match[1]);
   if (!wallet) {
     throw new ApiError(401, "unauthorized", "Invalid API key");
   }
@@ -157,7 +151,7 @@ function redirectToCheckout(reply: FastifyReply, url: string) {
 async function openHostedCheckout(
   request: FastifyRequest,
   ready: StripeConfig,
-  db: Database.Database,
+  store: Store,
   input: { walletId: string; credits: number; successUrl: string; cancelUrl: string },
 ) {
   let session: { id: string; url: string | null };
@@ -175,7 +169,7 @@ async function openHostedCheckout(
       "Stripe returned a Checkout URL without the hosted-page fragment",
     );
   }
-  saveCheckoutSessionUrl(db, {
+  await store.saveCheckoutSessionUrl({
     sessionId: session.id,
     walletId: input.walletId,
     credits: input.credits,
@@ -190,11 +184,16 @@ async function openHostedCheckout(
 
 export async function buildApp(options: BuildOptions): Promise<FastifyInstance> {
   const app = Fastify({ logger: options.logger ?? false });
-  const db = openDatabase(options.sqlitePath);
   const stripe = options.stripe ?? stripeFromEnv();
+  const mode = options.mode ?? stripe.mode;
+  const store = await openStore({
+    databaseUrl: options.databaseUrl,
+    sqlitePath: options.sqlitePath ?? ":memory:",
+    mode,
+  });
 
   app.addHook("onClose", async () => {
-    db.close();
+    await store.close();
   });
 
   app.addHook("preParsing", async (request, _reply, payload) => {
@@ -227,7 +226,24 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     });
   });
 
-  app.get("/health", async () => ({ status: "ok", service: "botsupply" }));
+  app.get("/health", async (request, reply) => {
+    const report = {
+      status: "ok" as "ok" | "error",
+      service: "botsupply",
+      storage: store.kind,
+      mode: store.mode,
+      database: "ok" as "ok" | "error",
+    };
+    try {
+      await store.ping();
+      return report;
+    } catch (error) {
+      request.log.error(error);
+      report.status = "error";
+      report.database = "error";
+      return reply.status(503).send(report);
+    }
+  });
 
   app.get("/", async (request, reply) => {
     const query = request.query as LandingQuery;
@@ -237,7 +253,7 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
   app.post("/v1/wallets", async (request, reply) => {
     const body = asRecord(request.body);
     rejectUnknown(body, ["label"]);
-    const { wallet, apiKey } = createWallet(db, readLabel(body));
+    const { wallet, apiKey } = await store.createWallet(readLabel(body));
     return reply.status(201).send({
       wallet_id: wallet.id,
       api_key: apiKey,
@@ -259,7 +275,7 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     const body = asRecord(request.body);
     rejectUnknown(body, ["credits"]);
     const credits = readCredits(body, 1, MAX_TOPUP);
-    const wallet = topUpWallet(db, id, credits);
+    const wallet = await store.topUpWallet(id, credits);
     if (!wallet) {
       throw new ApiError(404, "not_found", "Wallet not found");
     }
@@ -282,7 +298,7 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
         `Stripe checkout is not configured. Set ${missing.join(", ")}.`,
       );
     }
-    const wallet = bearerWallet(db, request);
+    const wallet = await bearerWallet(store, request);
     const { id } = request.params as { id: string };
     if (wallet.id !== id) {
       throw new ApiError(403, "forbidden", "API key does not match this wallet");
@@ -291,7 +307,7 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     rejectUnknown(body, ["credits"]);
     const credits = readCredits(body, CHECKOUT_MIN_CREDITS, CHECKOUT_MAX_CREDITS);
     const urls = checkoutUrls(stripe.ready.publicBaseUrl);
-    const opened = await openHostedCheckout(request, stripe.ready, db, {
+    const opened = await openHostedCheckout(request, stripe.ready, store, {
       walletId: wallet.id,
       credits,
       successUrl: urls.successUrl,
@@ -310,7 +326,7 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
 
   app.get("/v1/pay/s/:sessionId", async (request, reply) => {
     const { sessionId } = request.params as { sessionId: string };
-    const saved = findCheckoutSessionUrl(db, sessionId);
+    const saved = await store.findCheckoutSessionUrl(sessionId);
     if (!saved) throw new ApiError(404, "not_found", "Checkout session not found");
     return redirectToCheckout(reply, saved.url);
   });
@@ -328,14 +344,14 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     let walletId = query.wallet_id?.trim() ?? "";
     let successUrl = urls.successUrl;
     if (!walletId) {
-      const created = createWallet(db, "pay-link");
+      const created = await store.createWallet("pay-link");
       walletId = created.wallet.id;
       const base = stripe.ready.publicBaseUrl;
       successUrl = `${base}/?checkout=success&wallet_id=${encodeURIComponent(created.wallet.id)}&api_key=${encodeURIComponent(created.apiKey)}&session_id={CHECKOUT_SESSION_ID}`;
-    } else if (!findWalletById(db, walletId)) {
+    } else if (!(await store.findWalletById(walletId))) {
       throw new ApiError(404, "not_found", "Wallet not found");
     }
-    const opened = await openHostedCheckout(request, stripe.ready, db, {
+    const opened = await openHostedCheckout(request, stripe.ready, store, {
       walletId,
       credits,
       successUrl,
@@ -360,6 +376,9 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
       request.log.error(error);
       throw new ApiError(400, "invalid_signature", "Invalid Stripe signature");
     }
+    if (!eventMatchesStripeMode(store.mode, event.livemode)) {
+      return reply.send({ received: true, credited: false });
+    }
     if (event.type !== "checkout.session.completed") {
       return reply.send({ received: true, credited: false });
     }
@@ -367,7 +386,7 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     if (session.paymentStatus !== "paid") {
       return reply.send({ received: true, credited: false });
     }
-    const result = applyStripeCheckoutCredit(db, {
+    const result = await store.applyStripeCheckoutCredit({
       sessionId: session.sessionId,
       walletId: session.walletId,
       credits: session.credits,
@@ -388,7 +407,7 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
   app.get("/v1/catalog", async () => catalogDocument());
 
   app.get("/v1/balance", async (request) => {
-    const wallet = bearerWallet(db, request);
+    const wallet = await bearerWallet(store, request);
     return {
       wallet_id: wallet.id,
       balance_credits: wallet.balance_credits,
@@ -398,7 +417,7 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
   });
 
   app.post("/v1/purchase", async (request, reply) => {
-    const wallet = bearerWallet(db, request);
+    const wallet = await bearerWallet(store, request);
     const body = asRecord(request.body);
     rejectUnknown(body, ["sku"]);
     const sku = readSku(body);
@@ -406,7 +425,7 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     if (!product) {
       throw new ApiError(404, "unknown_sku", `Unknown sku: ${sku}`);
     }
-    const result = purchaseSku(db, wallet.id, product.sku, product.price_credits, product.payload);
+    const result = await store.purchaseSku(wallet.id, product.sku, product.price_credits, product.payload);
     if (!result.ok) {
       throw new ApiError(
         402,
@@ -418,13 +437,13 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
   });
 
   app.get("/v1/purchases/:id", async (request) => {
-    const wallet = bearerWallet(db, request);
+    const wallet = await bearerWallet(store, request);
     const { id } = request.params as { id: string };
-    const purchase = findPurchase(db, id);
+    const purchase = await store.findPurchase(id);
     if (!purchase || purchase.wallet_id !== wallet.id) {
       throw new ApiError(404, "not_found", "Purchase not found");
     }
-    const current = findWalletById(db, wallet.id);
+    const current = await store.findWalletById(wallet.id);
     return publicPurchase(purchase, current?.balance_credits ?? wallet.balance_credits);
   });
 

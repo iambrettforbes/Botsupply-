@@ -2,25 +2,30 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import Stripe from "stripe";
 import { buildApp } from "../src/app.js";
-import { applyStripeCheckoutCredit, createWallet, openDatabase } from "../src/db.js";
+import { openStore } from "../src/db.js";
 import {
   CENTS_PER_CREDIT,
+  CHECKOUT_MIN_CREDITS,
   checkoutLineItem,
   checkoutSessionParams,
   checkoutUrls,
   createStripeGateway,
+  eventMatchesStripeMode,
   hostedCheckoutUrl,
   stripeFromEnv,
+  stripeModeFromSecret,
   type CheckoutSessionInput,
+  type ResolvedStripe,
   type StripeGateway,
 } from "../src/stripe.js";
 
 const WEBHOOK_SECRET = "whsec_test_botsupply";
 
-function paidEvent(walletId: string, credits: number, sessionId = "cs_test_once") {
+function paidEvent(walletId: string, credits: number, sessionId = "cs_test_once", livemode = false) {
   return JSON.stringify({
     id: "evt_test",
     object: "event",
+    livemode,
     type: "checkout.session.completed",
     data: {
       object: {
@@ -35,6 +40,15 @@ function paidEvent(walletId: string, credits: number, sessionId = "cs_test_once"
 
 function signature(payload: string): string {
   return Stripe.webhooks.generateTestHeaderString({ payload, secret: WEBHOOK_SECRET });
+}
+
+function testStripe(gateway: StripeGateway): ResolvedStripe {
+  return {
+    devTopupEnabled: false,
+    missing: [],
+    mode: "test",
+    ready: { publicBaseUrl: "https://botsupply.onrender.com", gateway },
+  };
 }
 
 function testGateway(): { gateway: StripeGateway; calls: CheckoutSessionInput[] } {
@@ -88,9 +102,11 @@ test("checkout line item is one cent per credit", () => {
 
 test("stripeFromEnv keeps DEV top-up unless the secret key is set", () => {
   assert.equal(stripeFromEnv({}).devTopupEnabled, true);
+  assert.equal(stripeFromEnv({}).mode, "dev");
   assert.equal(stripeFromEnv({ STRIPE_SECRET_KEY: "  " }).devTopupEnabled, true);
   const partial = stripeFromEnv({ STRIPE_SECRET_KEY: "sk_test_botsupply" });
   assert.equal(partial.devTopupEnabled, false);
+  assert.equal(partial.mode, "test");
   assert.equal(partial.ready, null);
   assert.deepEqual(partial.missing, ["STRIPE_WEBHOOK_SECRET", "PUBLIC_BASE_URL"]);
   const ready = stripeFromEnv({
@@ -99,14 +115,29 @@ test("stripeFromEnv keeps DEV top-up unless the secret key is set", () => {
     PUBLIC_BASE_URL: "https://botsupply.onrender.com/",
   });
   assert.equal(ready.devTopupEnabled, false);
+  assert.equal(ready.mode, "test");
   assert.equal(ready.ready?.publicBaseUrl, "https://botsupply.onrender.com");
+  const live = stripeFromEnv({
+    STRIPE_SECRET_KEY: "sk_live_botsupply",
+    STRIPE_WEBHOOK_SECRET: WEBHOOK_SECRET,
+    PUBLIC_BASE_URL: "https://botsupply.onrender.com",
+  });
+  assert.equal(live.mode, "live");
+  assert.equal(stripeModeFromSecret("rk_test_botsupply"), "test");
+  assert.equal(stripeModeFromSecret("rk_live_botsupply"), "live");
+  assert.equal(CHECKOUT_MIN_CREDITS, 500);
+  assert.equal(eventMatchesStripeMode("test", false), true);
+  assert.equal(eventMatchesStripeMode("test", true), false);
+  assert.equal(eventMatchesStripeMode("live", true), true);
+  assert.equal(eventMatchesStripeMode("live", false), false);
+  assert.throws(() => stripeModeFromSecret("sk_botsupply"), /sk_test_/);
 });
 
-test("applyStripeCheckoutCredit is idempotent on session id", () => {
-  const db = openDatabase(":memory:");
+test("applyStripeCheckoutCredit is idempotent on session id", async () => {
+  const db = await openStore({ sqlitePath: ":memory:", mode: "test" });
   try {
-    const { wallet } = createWallet(db, "payer");
-    const first = applyStripeCheckoutCredit(db, {
+    const { wallet } = await db.createWallet("payer");
+    const first = await db.applyStripeCheckoutCredit({
       sessionId: "cs_once",
       walletId: wallet.id,
       credits: 250,
@@ -116,7 +147,7 @@ test("applyStripeCheckoutCredit is idempotent on session id", () => {
     assert.equal(first.applied, true);
     assert.equal(first.balance_credits, 250);
 
-    const replay = applyStripeCheckoutCredit(db, {
+    const replay = await db.applyStripeCheckoutCredit({
       sessionId: "cs_once",
       walletId: wallet.id,
       credits: 100_000,
@@ -127,15 +158,15 @@ test("applyStripeCheckoutCredit is idempotent on session id", () => {
     assert.equal(replay.credits, 250);
     assert.equal(replay.balance_credits, 250);
 
-    const second = applyStripeCheckoutCredit(db, {
+    const second = await db.applyStripeCheckoutCredit({
       sessionId: "cs_again",
       walletId: wallet.id,
       credits: 100,
     });
     assert.equal(second.ok && second.applied && second.balance_credits === 350, true);
-    assert.equal(applyStripeCheckoutCredit(db, { sessionId: "cs_missing", walletId: "wal_nope", credits: 100 }).ok, false);
+    assert.equal((await db.applyStripeCheckoutCredit({ sessionId: "cs_missing", walletId: "wal_nope", credits: 100 })).ok, false);
   } finally {
-    db.close();
+    await db.close();
   }
 });
 
@@ -143,11 +174,7 @@ test("checkout and webhook credit a wallet once, without calling Stripe", async 
   const { gateway, calls } = testGateway();
   const app = await buildApp({
     sqlitePath: ":memory:",
-    stripe: {
-      devTopupEnabled: false,
-      missing: [],
-      ready: { publicBaseUrl: "https://botsupply.onrender.com", gateway },
-    },
+    stripe: testStripe(gateway),
   });
   try {
     const created = await app.inject({
@@ -197,7 +224,7 @@ test("checkout and webhook credit a wallet once, without calling Stripe", async 
       method: "POST",
       url: `/v1/wallets/${wallet.wallet_id}/checkout`,
       headers: { authorization: `Bearer ${stranger.api_key}` },
-      payload: { credits: 100 },
+      payload: { credits: 500 },
     });
     assert.equal(mismatch.statusCode, 403);
 
@@ -244,6 +271,25 @@ test("checkout and webhook credit a wallet once, without calling Stripe", async 
     assert.equal(unpaid.statusCode, 200);
     assert.equal(unpaid.json().credited, false);
     assert.equal(unpaid.json().balance_credits, undefined);
+
+    const livePayload = paidEvent(wallet.wallet_id, 500, "cs_live_other_mode", true);
+    const ignored = await app.inject({
+      method: "POST",
+      url: "/v1/stripe/webhook",
+      headers: {
+        "content-type": "application/json",
+        "stripe-signature": signature(livePayload),
+      },
+      payload: livePayload,
+    });
+    assert.equal(ignored.statusCode, 200, ignored.body);
+    assert.equal(ignored.json().credited, false);
+    const unchanged = await app.inject({
+      method: "GET",
+      url: "/v1/balance",
+      headers: { authorization: `Bearer ${wallet.api_key}` },
+    });
+    assert.equal(unchanged.json().balance_credits, 500);
   } finally {
     await app.close();
   }
@@ -281,49 +327,38 @@ test("GET /v1/pay redirects to a hosted Checkout URL that includes the fragment"
   const { gateway, calls } = testGateway();
   const app = await buildApp({
     sqlitePath: ":memory:",
-    stripe: {
-      devTopupEnabled: false,
-      missing: [],
-      ready: { publicBaseUrl: "https://botsupply.onrender.com", gateway },
-    },
+    stripe: testStripe(gateway),
   });
   try {
-    const pay = await app.inject({ method: "GET", url: "/v1/pay?credits=100" });
+    const pay = await app.inject({ method: "GET", url: "/v1/pay?credits=500" });
     assert.equal(pay.statusCode, 302);
     assert.equal(pay.headers.location, "https://checkout.stripe.com/c/pay/cs_test_1#fid_test_1");
     assert.match(String(pay.headers.location), /#/);
-    assert.equal(calls[0]?.credits, 100);
+    assert.equal(calls[0]?.credits, 500);
     assert.match(calls[0]?.successUrl ?? "", /api_key=/);
     assert.match(calls[0]?.successUrl ?? "", /\{CHECKOUT_SESSION_ID\}/);
 
     const created = await app.inject({ method: "POST", url: "/v1/wallets", payload: {} });
     const wallet = created.json() as { wallet_id: string };
-    const named = await app.inject({ method: "GET", url: `/v1/pay?credits=200&wallet_id=${wallet.wallet_id}` });
+    const named = await app.inject({ method: "GET", url: `/v1/pay?credits=600&wallet_id=${wallet.wallet_id}` });
     assert.equal(named.statusCode, 302);
     assert.equal(calls[1]?.walletId, wallet.wallet_id);
-    assert.equal(calls[1]?.credits, 200);
+    assert.equal(calls[1]?.credits, 600);
     assert.equal(calls[1]?.successUrl.includes("api_key="), false);
 
-    const low = await app.inject({ method: "GET", url: "/v1/pay?credits=10" });
+    const low = await app.inject({ method: "GET", url: "/v1/pay?credits=100" });
     assert.equal(low.statusCode, 400);
 
     const bare = await buildApp({
       sqlitePath: ":memory:",
-      stripe: {
-        devTopupEnabled: false,
-        missing: [],
-        ready: {
-          publicBaseUrl: "https://botsupply.onrender.com",
-          gateway: {
-            async createCheckoutSession() {
-              return { id: "cs_bare", url: "https://checkout.stripe.com/c/pay/cs_bare" };
-            },
-            constructEvent() {
-              throw new Error("unused");
-            },
-          },
+      stripe: testStripe({
+        async createCheckoutSession() {
+          return { id: "cs_bare", url: "https://checkout.stripe.com/c/pay/cs_bare" };
         },
-      },
+        constructEvent() {
+          throw new Error("unused");
+        },
+      }),
     });
     try {
       const createdWallet = await bare.inject({ method: "POST", url: "/v1/wallets", payload: {} });
@@ -332,7 +367,7 @@ test("GET /v1/pay redirects to a hosted Checkout URL that includes the fragment"
         method: "POST",
         url: `/v1/wallets/${body.wallet_id}/checkout`,
         headers: { authorization: `Bearer ${body.api_key}` },
-        payload: { credits: 100 },
+        payload: { credits: 500 },
       });
       assert.equal(broken.statusCode, 502);
       assert.equal(broken.json().error.code, "incomplete_checkout_url");

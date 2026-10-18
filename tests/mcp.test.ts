@@ -58,6 +58,12 @@ test("MCP tools list the live catalog and do not invent a reservation tool", asy
     const purchase = listed.result?.tools?.find((tool) => tool.name === "purchase");
     assert.match(purchase?.description ?? "", /does not place a reservation/i);
     assert.match(purchase?.description ?? "", /sku/);
+    const checkoutTool = listed.result?.tools?.find((tool) => tool.name === "create_checkout");
+    assert.match(checkoutTool?.description ?? "", /500/);
+    const checkoutSchema = (checkoutTool as { inputSchema?: { properties?: { credits?: { minimum?: number; maximum?: number } } } } | undefined)
+      ?.inputSchema;
+    assert.equal(checkoutSchema?.properties?.credits?.minimum, 500);
+    assert.equal(checkoutSchema?.properties?.credits?.maximum, 100000);
     assert.equal(listed.result?.tools?.some((tool) => /reserv/i.test(tool.name)), false);
 
     const catalog = toolJson(await rpc(app, "tools/call", { name: "list_catalog", arguments: {} }));
@@ -164,7 +170,7 @@ test("MCP open, balance, and purchase wrap the HTTP routes", async () => {
     const checkout = toolJson(
       await rpc(app, "tools/call", {
         name: "create_checkout",
-        arguments: { credits: 100 },
+        arguments: { credits: 500 },
       }, { authorization: `Bearer ${wallet.api_key}` }),
     );
     assert.equal(checkout.isError, true);
@@ -188,6 +194,7 @@ test("MCP create_checkout returns the existing checkout URL", async () => {
     stripe: {
       devTopupEnabled: false,
       missing: [],
+      mode: "test",
       ready: { publicBaseUrl: "https://botsupply.onrender.com", gateway },
     },
   });
@@ -198,13 +205,13 @@ test("MCP create_checkout returns the existing checkout URL", async () => {
       await rpc(
         app,
         "tools/call",
-        { name: "create_checkout", arguments: { credits: 250, api_key: wallet.api_key } },
+        { name: "create_checkout", arguments: { credits: 500, api_key: wallet.api_key } },
       ),
     );
     assert.equal(checkout.isError, false);
     const body = checkout.body as { url: string; stripe_url: string; wallet_id: string; credits: number };
     assert.equal(body.wallet_id, wallet.wallet_id);
-    assert.equal(body.credits, 250);
+    assert.equal(body.credits, 500);
     assert.equal(body.url, "https://botsupply.onrender.com/v1/pay/s/cs_test_mcp");
     assert.match(body.stripe_url, /#fid_mcp$/);
   } finally {

@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { CREDIT_VALUE_USD, PRODUCTS } from "../src/catalog.js";
 import { buildApp } from "../src/app.js";
+import { openStore } from "../src/db.js";
 import { resolveSqlitePath } from "../src/paths.js";
 
 const PRICES: Record<string, number> = {
@@ -46,7 +50,13 @@ test("health, landing page, and catalog", async () => {
   try {
     const health = await app.inject({ method: "GET", url: "/health" });
     assert.equal(health.statusCode, 200);
-    assert.deepEqual(health.json(), { status: "ok", service: "botsupply" });
+    assert.deepEqual(health.json(), {
+      status: "ok",
+      service: "botsupply",
+      storage: "sqlite",
+      mode: "dev",
+      database: "ok",
+    });
 
     const home = await app.inject({ method: "GET", url: "/" });
     assert.equal(home.statusCode, 200);
@@ -218,6 +228,119 @@ test("auth and unknown resources", async () => {
     assert.equal(badCredits.statusCode, 400);
   } finally {
     await app.close();
+  }
+});
+
+test("test-mode wallets are not visible in live mode", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "botsupply-mode-"));
+  const sqlitePath = path.join(dir, "botsupply.sqlite");
+  const testApp = await buildApp({ sqlitePath, mode: "test" });
+  const liveApp = await buildApp({ sqlitePath, mode: "live" });
+  try {
+    const created = await testApp.inject({
+      method: "POST",
+      url: "/v1/wallets",
+      payload: { label: "test-only" },
+    });
+    assert.equal(created.statusCode, 201);
+    const wallet = created.json() as { wallet_id: string; api_key: string };
+    const topup = await testApp.inject({
+      method: "POST",
+      url: `/v1/wallets/${wallet.wallet_id}/topup`,
+      payload: { credits: 500 },
+    });
+    assert.equal(topup.statusCode, 200);
+    const bought = await testApp.inject({
+      method: "POST",
+      url: "/v1/purchase",
+      headers: { authorization: `Bearer ${wallet.api_key}` },
+      payload: { sku: "pack.venue-hours" },
+    });
+    assert.equal(bought.statusCode, 201, bought.body);
+    const purchaseId = bought.json().purchase_id as string;
+
+    const liveBalance = await liveApp.inject({
+      method: "GET",
+      url: "/v1/balance",
+      headers: { authorization: `Bearer ${wallet.api_key}` },
+    });
+    assert.equal(liveBalance.statusCode, 401);
+    const liveTopup = await liveApp.inject({
+      method: "POST",
+      url: `/v1/wallets/${wallet.wallet_id}/topup`,
+      payload: { credits: 10 },
+    });
+    assert.equal(liveTopup.statusCode, 404);
+    const livePurchase = await liveApp.inject({
+      method: "GET",
+      url: `/v1/purchases/${purchaseId}`,
+      headers: { authorization: `Bearer ${wallet.api_key}` },
+    });
+    assert.equal(livePurchase.statusCode, 401);
+
+    const testStore = await openStore({ sqlitePath, mode: "test" });
+    const liveStore = await openStore({ sqlitePath, mode: "live" });
+    try {
+      assert.equal(await liveStore.findWalletByApiKey(wallet.api_key), undefined);
+      assert.equal(await liveStore.findWalletById(wallet.wallet_id), undefined);
+      assert.equal(await liveStore.findPurchase(purchaseId), undefined);
+      const seen = await testStore.findWalletByApiKey(wallet.api_key);
+      assert.equal(seen?.balance_credits, 480);
+      await testStore.saveCheckoutSessionUrl({
+        sessionId: "cs_test_hidden",
+        walletId: wallet.wallet_id,
+        credits: 500,
+        url: "https://checkout.stripe.com/c/pay/cs_test_hidden#fid_hidden",
+      });
+      assert.equal(await liveStore.findCheckoutSessionUrl("cs_test_hidden"), undefined);
+      const cross = await liveStore.applyStripeCheckoutCredit({
+        sessionId: "cs_test_cross",
+        walletId: wallet.wallet_id,
+        credits: 500,
+      });
+      assert.equal(cross.ok, false);
+      const applied = await testStore.applyStripeCheckoutCredit({
+        sessionId: "cs_test_cross",
+        walletId: wallet.wallet_id,
+        credits: 500,
+      });
+      assert.equal(applied.ok && applied.applied && applied.balance_credits === 980, true);
+      const replayOnLive = await liveStore.applyStripeCheckoutCredit({
+        sessionId: "cs_test_cross",
+        walletId: wallet.wallet_id,
+        credits: 500,
+      });
+      assert.equal(replayOnLive.ok, false);
+    } finally {
+      await testStore.close();
+      await liveStore.close();
+    }
+
+    const hiddenPay = await liveApp.inject({ method: "GET", url: "/v1/pay/s/cs_test_hidden" });
+    assert.equal(hiddenPay.statusCode, 404);
+    const visiblePay = await testApp.inject({ method: "GET", url: "/v1/pay/s/cs_test_hidden" });
+    assert.equal(visiblePay.statusCode, 302);
+    assert.match(String(visiblePay.headers.location), /#fid_hidden$/);
+
+    const testBalance = await testApp.inject({
+      method: "GET",
+      url: "/v1/balance",
+      headers: { authorization: `Bearer ${wallet.api_key}` },
+    });
+    assert.equal(testBalance.statusCode, 200);
+    assert.equal(testBalance.json().balance_credits, 980);
+
+    const testHealth = await testApp.inject({ method: "GET", url: "/health" });
+    assert.equal(testHealth.json().storage, "sqlite");
+    assert.equal(testHealth.json().mode, "test");
+    assert.equal(testHealth.json().database, "ok");
+    const liveHealth = await liveApp.inject({ method: "GET", url: "/health" });
+    assert.equal(liveHealth.json().mode, "live");
+    assert.equal(liveHealth.json().database, "ok");
+  } finally {
+    await testApp.close();
+    await liveApp.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
