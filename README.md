@@ -39,7 +39,9 @@ Open [http://127.0.0.1:4317](http://127.0.0.1:4317) for the price sheet and curl
 
 ## Data
 
-SQLite is a single file.
+When `DATABASE_URL` is set, wallets, purchases, checkout sessions, and credited Checkout sessions are stored in Postgres. Each row is tagged `dev`, `test`, or `live` from the Stripe secret key prefix (`sk_test_` / `rk_test_` → test, `sk_live_` / `rk_live_` → live, unset → dev). Every lookup includes that tag, so a test-mode process does not read live rows. The webhook accepts `checkout.session.completed` only when the event's `livemode` matches that tag.
+
+When `DATABASE_URL` is unset, the same records stay in a SQLite file:
 
 1. `SQLITE_PATH`, if set, is used as-is.
 2. Otherwise the file is `/data/botsupply.sqlite` when `/data` is writable.
@@ -77,7 +79,7 @@ curl -s -X POST http://127.0.0.1:4317/v1/wallets/$WALLET_ID/topup \
 
 ### `POST /v1/wallets/:id/checkout`
 
-Paid top-up. Requires `Authorization: Bearer <api_key>` for that wallet, and all three Stripe env vars. Body is `{ "credits": number }` from 100 to 100000. Each credit is a 1-cent Checkout line item (`unit_amount` 1, quantity = credits).
+Paid top-up. Requires `Authorization: Bearer <api_key>` for that wallet, and all three Stripe env vars. Body is `{ "credits": number }` from 500 to 100000 ($5 to $1,000). Each credit is a 1-cent Checkout line item (`unit_amount` 1, quantity = credits).
 
 ```bash
 curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \
@@ -88,7 +90,7 @@ curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \
 
 The response `url` is `https://<host>/v1/pay/s/<session_id>`. Opening it redirects to hosted Checkout and keeps the `#` fragment Stripe requires. A session id alone shows “This link is incomplete.” `stripe_url` is the full Checkout link.
 
-`GET /v1/pay?credits=100` creates a demo wallet and redirects to Checkout. Add `wallet_id` to pay into an existing wallet. Credits are 100 to 100000.
+`GET /v1/pay?credits=500` creates a demo wallet and redirects to Checkout. Add `wallet_id` to pay into an existing wallet. Credits are 500 to 100000. The minimum top-up is $5.
 
 Credits are applied when Stripe calls `POST /v1/stripe/webhook` with `checkout.session.completed` and `payment_status` `paid`. The same Checkout Session id is credited once.
 
@@ -138,8 +140,10 @@ Replays a purchase for the wallet that owns it. Same bearer token as purchase.
 ### `GET /health`
 
 ```json
-{ "status": "ok", "service": "botsupply" }
+{ "status": "ok", "service": "botsupply", "storage": "sqlite", "mode": "dev", "database": "ok" }
 ```
+
+`storage` is `postgres` or `sqlite`. `mode` is `dev`, `test`, or `live`. `database` is `ok` after a successful ping, and the route returns **503** when the ping fails. With `DATABASE_URL` set and a test Stripe key, a healthy process reports `"storage":"postgres"` and `"mode":"test"`.
 
 ## Tests
 

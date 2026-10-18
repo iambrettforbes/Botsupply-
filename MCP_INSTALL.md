@@ -109,8 +109,8 @@ Then call `open_wallet`, save `api_key`, and call `get_balance`.
 ## Limits
 
 - Live SKUs are whatever `GET /v1/catalog` returns. Today that is `pack.venue-hours` (20), `pack.competitor-snapshot` (50), and `recipe.book-table` (100).
-- 1 credit = $0.01 USD. Checkout `credits` is an integer from 100 to 100000.
+- 1 credit = $0.01 USD. Checkout `credits` is an integer from 500 to 100000. The minimum top-up is $5.
 - Each `purchase` charges again. It is not idempotent.
-- Render's free web service sleeps after about 15 minutes idle. Retry `GET /health` until it returns `{"status":"ok","service":"botsupply"}`.
-- SQLite is on an ephemeral disk. Wallets, credits, and purchases disappear on deploy, restart, or spin-down. Open a new wallet after the service comes back.
+- Render's free web service sleeps after about 15 minutes idle. Retry `GET /health` until it returns `"status":"ok"`.
+- With `DATABASE_URL` set, wallets, credits, and purchases persist in Postgres and are scoped to the Stripe mode (`dev`, `test`, or `live`). Without it, SQLite is on an ephemeral disk and resets on deploy, restart, or spin-down.
 - This server does not place reservations, scrape sites, or sell anything that is not in the catalog.

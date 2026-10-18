@@ -75,13 +75,13 @@ curl -s -X POST "$BASE/v1/wallets" \
 
 ## 4. Paid top-up
 
-If Checkout works, create a session for 100 credits (`Authorization: Bearer` must match the wallet):
+If Checkout works, create a session for 500 credits, the $5 minimum (`Authorization: Bearer` must match the wallet):
 
 ```bash
 curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \
   -H "authorization: Bearer $API_KEY" \
   -H 'content-type: application/json' \
-  -d '{"credits":100}'
+  -d '{"credits":500}'
 ```
 
 **201**
@@ -92,8 +92,8 @@ curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \
   "url": "https://botsupply.onrender.com/v1/pay/s/cs_…",
   "stripe_url": "https://checkout.stripe.com/c/pay/cs_…#…",
   "wallet_id": "wal_…",
-  "credits": 100,
-  "amount_cents": 100,
+  "credits": 500,
+  "amount_cents": 500,
   "currency": "usd"
 }
 ```
@@ -103,14 +103,14 @@ Open `url`. That same-origin path **302**s to `stripe_url` and keeps the fragmen
 If the hosted Checkout page is incomplete, paid top-up is the short redirect (creates a throwaway wallet and **302**s to Checkout):
 
 ```bash
-curl -sI "$BASE/v1/pay?credits=100"
+curl -sI "$BASE/v1/pay?credits=500"
 ```
 
-Until that redirect is live on the host, use a Stripe Payment Link for the same $1.00 / 100-credit top-up. Do not use DEV `/topup` on the hosted service while Stripe keys are set.
+Until that redirect is live on the host, use a Stripe Payment Link for the same $5.00 / 500-credit top-up. Use DEV `/topup` only while `STRIPE_SECRET_KEY` is unset.
 
 ## 5. `POST /v1/purchase`
 
-The body field is `sku`. Do not send `sku_id`. `pack.venue-hours` costs 20 credits, so the wallet needs a balance first.
+The body field is `sku`. Do not send `sku_id`. `pack.venue-hours` costs 20 credits, so the wallet needs a balance first. The sample below is the balance after a 500-credit top-up.
 
 ```bash
 curl -s -X POST "$BASE/v1/purchase" \
@@ -127,7 +127,7 @@ curl -s -X POST "$BASE/v1/purchase" \
   "wallet_id": "wal_…",
   "sku": "pack.venue-hours",
   "credits_charged": 20,
-  "balance_credits": 80,
+  "balance_credits": 480,
   "created_at": "2026-01-01T00:00:00.000Z",
   "payload": {}
 }

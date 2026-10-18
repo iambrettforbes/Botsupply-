@@ -1,5 +1,6 @@
 import { createMcpHandler, fromJsonSchema, McpServer, type AuthInfo } from "@modelcontextprotocol/server";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { CHECKOUT_MAX_CREDITS, CHECKOUT_MIN_CREDITS } from "./stripe.js";
 
 const SERVER_NAME = "botsupply";
 const SERVER_VERSION = "1.0.0";
@@ -77,9 +78,9 @@ const checkoutSchema = fromJsonSchema<{ credits: number; wallet_id?: string; api
   properties: {
     credits: {
       type: "integer",
-      minimum: 100,
-      maximum: 100000,
-      description: "Credits to buy. 1 credit = $0.01 USD. Same limits as POST /v1/wallets/:id/checkout.",
+      minimum: CHECKOUT_MIN_CREDITS,
+      maximum: CHECKOUT_MAX_CREDITS,
+      description: `Credits to buy. 1 credit = $0.01 USD. Minimum ${CHECKOUT_MIN_CREDITS} credits ($5). Same limits as POST /v1/wallets/:id/checkout.`,
     },
     wallet_id: {
       type: "string",
@@ -144,7 +145,7 @@ function annotateCatalog(body: unknown): unknown {
     limits: [
       "Credits are prepaid. These tools do not mint credits or add SKUs.",
       "BotSupply does not place reservations or scrape venues.",
-      "The hosted service is on Render's free tier. The first request after idle can take about a minute, and the ephemeral disk can reset wallets on restart or deploy.",
+      "The first request after idle can take about a minute on the free Render service. Wallets persist in Postgres when DATABASE_URL is set. Without DATABASE_URL the file store can reset on restart or deploy.",
     ],
   };
 }
@@ -216,7 +217,7 @@ function registerTools(server: McpServer, client: BotSupplyClient, defaultApiKey
     {
       title: "Create checkout",
       description:
-        "Start a Stripe Checkout credit top-up. Same as POST /v1/wallets/:id/checkout. Returns the checkout url (open that URL; it keeps Stripe's hosted-page fragment). credits is an integer from 100 to 100000. Credits are applied only after Stripe reports the session paid. Returns the API error when Stripe is not configured.",
+        `Start a Stripe Checkout credit top-up. Same as POST /v1/wallets/:id/checkout. Returns the checkout url (open that URL; it keeps Stripe's hosted-page fragment). credits is an integer from ${CHECKOUT_MIN_CREDITS} to ${CHECKOUT_MAX_CREDITS} ($5 minimum). Credits are applied only after Stripe reports the session paid. Returns the API error when Stripe is not configured.`,
       inputSchema: checkoutSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
@@ -294,7 +295,7 @@ async function callHttp(
       body: {
         error: {
           code: "upstream_unreachable",
-          message: `Could not reach BotSupply at ${baseUrl} (${message}). The free Render service sleeps after idle time; retry after GET /health returns {"status":"ok","service":"botsupply"}.`,
+          message: `Could not reach BotSupply at ${baseUrl} (${message}). The free Render service sleeps after idle time; retry after GET /health returns {"status":"ok"}.`,
         },
       },
     };

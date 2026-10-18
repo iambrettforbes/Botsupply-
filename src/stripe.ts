@@ -2,8 +2,12 @@ import Stripe from "stripe";
 
 /** 1 credit = 1 cent = $0.01 USD. */
 export const CENTS_PER_CREDIT = 1;
-export const CHECKOUT_MIN_CREDITS = 100;
+/** Minimum paid top-up: $5. */
+export const CHECKOUT_MIN_CREDITS = 500;
 export const CHECKOUT_MAX_CREDITS = 100_000;
+
+/** Storage partition. `dev` when no Stripe secret is set; otherwise the key prefix. */
+export type StripeMode = "dev" | "test" | "live";
 
 export type StripeConfig = {
   publicBaseUrl: string;
@@ -15,6 +19,7 @@ export type ResolvedStripe = {
   devTopupEnabled: boolean;
   missing: string[];
   ready: StripeConfig | null;
+  mode: StripeMode;
 };
 
 export type CheckoutSessionInput = {
@@ -26,6 +31,8 @@ export type CheckoutSessionInput = {
 
 export type CheckoutCompletedEvent = {
   type: string;
+  /** Stripe sets this on every event. `true` is live mode. */
+  livemode?: boolean;
   data: {
     object: {
       id?: string;
@@ -105,11 +112,31 @@ function trimmed(env: NodeJS.ProcessEnv, key: string): string {
   return env[key]?.trim() ?? "";
 }
 
+/** `dev` when the secret is unset. Test and live follow the Stripe key prefix. */
+export function stripeModeFromSecret(secretKey: string): StripeMode {
+  const key = secretKey.trim();
+  if (!key) return "dev";
+  if (key.startsWith("sk_live_") || key.startsWith("rk_live_")) return "live";
+  if (key.startsWith("sk_test_") || key.startsWith("rk_test_")) return "test";
+  throw new Error("STRIPE_SECRET_KEY must start with sk_test_, rk_test_, sk_live_, or rk_live_");
+}
+
+/**
+ * Webhook events carry Stripe's livemode flag. Test keys accept livemode false.
+ * Live keys accept livemode true. A missing flag is left for the caller to process.
+ */
+export function eventMatchesStripeMode(mode: StripeMode, livemode: boolean | undefined): boolean {
+  if (typeof livemode !== "boolean") return true;
+  if (mode === "live") return livemode;
+  return !livemode;
+}
+
 /** Reads Stripe settings. An empty string counts as unset. No secrets are logged. */
 export function stripeFromEnv(env: NodeJS.ProcessEnv = process.env): ResolvedStripe {
   const secretKey = trimmed(env, "STRIPE_SECRET_KEY");
+  const mode = stripeModeFromSecret(secretKey);
   if (!secretKey) {
-    return { devTopupEnabled: true, missing: [], ready: null };
+    return { devTopupEnabled: true, missing: [], ready: null, mode };
   }
   const webhookSecret = trimmed(env, "STRIPE_WEBHOOK_SECRET");
   const publicBaseUrl = trimmed(env, "PUBLIC_BASE_URL").replace(/\/$/, "");
@@ -117,11 +144,12 @@ export function stripeFromEnv(env: NodeJS.ProcessEnv = process.env): ResolvedStr
   if (!webhookSecret) missing.push("STRIPE_WEBHOOK_SECRET");
   if (!publicBaseUrl) missing.push("PUBLIC_BASE_URL");
   if (missing.length > 0) {
-    return { devTopupEnabled: false, missing, ready: null };
+    return { devTopupEnabled: false, missing, ready: null, mode };
   }
   return {
     devTopupEnabled: false,
     missing: [],
+    mode,
     ready: {
       publicBaseUrl,
       gateway: createStripeGateway(secretKey, webhookSecret),
