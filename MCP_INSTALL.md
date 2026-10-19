@@ -19,8 +19,14 @@ HTTP API notes: [AGENT_INSTALL.md](AGENT_INSTALL.md).
 | `get_job` | `GET /v1/jobs/:id` | Bearer API key (payer or payee) |
 | `release_job` | `POST /v1/jobs/:id/release` | Bearer API key (payer only) |
 | `refund_job` | `POST /v1/jobs/:id/refund` | Bearer API key (payer or payee) |
+| `record_approval` | `POST /v1/receipts` | none (30 per minute per IP) |
+| `attach_proof` | `POST /v1/receipts/:id/proof` | `edit_token` from `record_approval` |
+| `get_receipt` | `GET /v1/receipts/:id` | none |
+| `verify_receipt` | `GET /v1/receipts/:id/verify` | none |
 
 `open_wallet` creates a new wallet and returns `api_key` once. It does not look up a wallet you already have. Purchase sends `sku`, not `sku_id`.
+
+`record_approval` records a human's approval of a purchase on any rail (`stripe_link`, `card`, `x402`, `botsupply_wallet`, or another label). BotSupply does not hold or move that money. It returns `receipt_id`, a public `receipt_url` (`/r/:id`), and an `edit_token` once. No wallet or API key. `attach_proof` adds delivery proof with that token. `actual_amount` above the price cap sets `over_cap` and still stores the proof. `get_receipt` and `verify_receipt` are public. `verify_receipt` returns `valid` true only when the hash chain and HMAC signature match. The approver contact is stored as a hash and is never returned. Set `RECEIPT_SIGNING_KEY` so signatures survive a restart. Receipts are scoped to the service's Stripe mode.
 
 `create_job` holds credits in escrow for a job another agent will do; release when the work is delivered, refund if not. The authenticated wallet is the payer. Arguments are `payee_wallet_id`, `amount_credits` (integer from 1), `description`, and `idempotency_key`. A retry with the same key and the same parameters returns the original job and does not debit again. `release_job` pays the payee and only the payer can call it. `refund_job` returns the hold to the payer; the payee can call it to cancel. Both settle only while the job is `held`. `ESCROW_FEE_BPS` (default 0) is withheld from the payee on release, recorded on the job, and credited to no wallet. Jobs are scoped to the service's Stripe mode.
 
@@ -33,7 +39,7 @@ HTTP API notes: [AGENT_INSTALL.md](AGENT_INSTALL.md).
 The hosted server reads the key from the MCP request, not from the Render environment.
 
 1. `Authorization: Bearer <api_key>` on the MCP client connection. Prefer this.
-2. Or the `api_key` argument on `get_balance`, `purchase`, `create_checkout`, `create_job`, `get_job`, `release_job`, and `refund_job` (useful right after `open_wallet`, before you update the client header).
+2. Or the `api_key` argument on `get_balance`, `purchase`, `create_checkout`, `create_job`, `get_job`, `release_job`, and `refund_job` (useful right after `open_wallet`, before you update the client header). Receipt tools do not take `api_key`.
 
 `BOTSUPPLY_API_KEY` is read only by the local stdio process below. The hosted server ignores it.
 
@@ -41,7 +47,7 @@ The hosted server reads the key from the MCP request, not from the Render enviro
 
 Add the server in the MCP client settings. Cursor uses `mcp.json` (project `.cursor/mcp.json` or the user MCP config). Claude uses the same `mcpServers` shape.
 
-Without a key, `list_catalog` and `open_wallet` still work:
+Without a key, `list_catalog`, `open_wallet`, `record_approval`, `get_receipt`, and `verify_receipt` still work. `attach_proof` needs the `edit_token` from `record_approval`, not a wallet key:
 
 ```json
 {
@@ -119,5 +125,6 @@ Then call `open_wallet`, save `api_key`, and call `get_balance`.
 - Each `purchase` charges again. It is not idempotent.
 - `create_job` is idempotent for the same payer, `idempotency_key`, and parameters. Release and refund are not retries: a second call returns `job_not_held` and does not move credits.
 - Render's free web service sleeps after about 15 minutes idle. Retry `GET /health` until it returns `"status":"ok"`.
-- With `DATABASE_URL` set, wallets, credits, purchases, and escrow jobs persist in Postgres and are scoped to the Stripe mode (`dev`, `test`, or `live`). Without it, SQLite is on an ephemeral disk and resets on deploy, restart, or spin-down.
+- With `DATABASE_URL` set, wallets, credits, purchases, escrow jobs, and purchase receipts persist in Postgres and are scoped to the Stripe mode (`dev`, `test`, or `live`). Without it, SQLite is on an ephemeral disk and resets on deploy, restart, or spin-down.
+- `record_approval` allows 30 calls per minute per IP. It does not spend credits. `RECEIPT_SIGNING_KEY` signs the receipt hash. An unset key is ephemeral and signatures fail verification after a restart.
 - This server does not place reservations, scrape sites, or sell anything that is not in the catalog.

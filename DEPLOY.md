@@ -1,6 +1,6 @@
 # Deploy BotSupply
 
-The app is a single Node.js process. It listens on `0.0.0.0:$PORT` (default `4317`) and serves `GET /health` for platform checks. When `DATABASE_URL` is set, wallets, purchases, Checkout rows, and escrow jobs are stored in Postgres and tagged with the Stripe mode (`dev`, `test`, or `live`). Otherwise SQLite is stored at `/data/botsupply.sqlite` when that directory is writable, or at `./data/botsupply.sqlite`. Set `SQLITE_PATH` to override the file path.
+The app is a single Node.js process. It listens on `0.0.0.0:$PORT` (default `4317`) and serves `GET /health` for platform checks. When `DATABASE_URL` is set, wallets, purchases, Checkout rows, escrow jobs, and purchase receipts are stored in Postgres and tagged with the Stripe mode (`dev`, `test`, or `live`). Otherwise SQLite is stored at `/data/botsupply.sqlite` when that directory is writable, or at `./data/botsupply.sqlite`. Set `SQLITE_PATH` to override the file path.
 
 **1 credit = $0.01 USD.** DEV top-up stays free until `STRIPE_SECRET_KEY` is set. Paid Checkout needs the Stripe variables below.
 
@@ -11,8 +11,9 @@ The app is a single Node.js process. It listens on `0.0.0.0:$PORT` (default `431
 | `PORT` | Set by Render and by `fly.toml` | HTTP port. Defaults to `4317`. |
 | `NODE_ENV` | No | `production` in the container and on Render. |
 | `SQLITE_PATH` | No | Absolute path to the SQLite file. Used when `DATABASE_URL` is unset. |
-| `DATABASE_URL` | No | Postgres connection string. When set, the process stores wallets, purchases, checkout sessions, credits, and escrow jobs in Postgres and pings that database from `/health`. |
+| `DATABASE_URL` | No | Postgres connection string. When set, the process stores wallets, purchases, checkout sessions, credits, escrow jobs, and purchase receipts in Postgres and pings that database from `/health`. |
 | `ESCROW_FEE_BPS` | No | Platform fee in basis points, withheld from the payee when an escrow job is released. Integer 0 to 10000. Default 0. The fee is recorded on the job and credited to no wallet. |
+| `RECEIPT_SIGNING_KEY` | No | HMAC secret for purchase-receipt hashes. Use a long random string. If unset, the process generates an ephemeral key, logs a warning, and receipt signatures do not survive a restart. |
 | `STRIPE_SECRET_KEY` | No | Stripe secret key. When set, DEV top-up is disabled. The key prefix selects storage mode: `sk_test_`/`rk_test_` → `test`, `sk_live_`/`rk_live_` → `live`. |
 | `STRIPE_WEBHOOK_SECRET` | With the secret key | Signing secret for `POST /v1/stripe/webhook`. |
 | `PUBLIC_BASE_URL` | With the secret key | Public origin for Checkout success and cancel URLs, no trailing path. |

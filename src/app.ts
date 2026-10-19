@@ -11,6 +11,18 @@ import {
 import { ApiError } from "./errors.js";
 import { renderLanding, type LandingQuery } from "./landing.js";
 import { mountMcp } from "./mcp.js";
+import { renderReceiptPage } from "./receipt-page.js";
+import {
+  RECEIPT_RATE_LIMIT_MAX,
+  RECEIPT_RATE_WINDOW_MS,
+  clientIp,
+  createRateLimiter,
+  parseApprovalBody,
+  parseProofBody,
+  resolveReceiptSigningKey,
+  toPublicReceipt,
+  verifyReceiptRecord,
+} from "./receipts.js";
 import {
   CHECKOUT_MAX_CREDITS,
   CHECKOUT_MIN_CREDITS,
@@ -36,6 +48,10 @@ export type BuildOptions = {
   stripe?: ResolvedStripe;
   /** Overrides `ESCROW_FEE_BPS`. Basis points withheld from the payee on release. Default 0. */
   escrowFeeBps?: number;
+  /** Overrides `RECEIPT_SIGNING_KEY` for receipt HMAC signatures. */
+  receiptSigningKey?: string;
+  /** Overrides the per-IP limit on `POST /v1/receipts`. */
+  receiptRateLimit?: { max: number; windowMs: number };
 };
 
 const MAX_TOPUP = 1_000_000;
@@ -238,10 +254,16 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
   const stripe = options.stripe ?? stripeFromEnv();
   const mode = options.mode ?? stripe.mode;
   const escrowFeeBps = readEscrowFeeBps(process.env.ESCROW_FEE_BPS, options.escrowFeeBps);
+  const receiptKey = resolveReceiptSigningKey(options.receiptSigningKey);
+  const receiptLimiter = createRateLimiter(
+    options.receiptRateLimit?.max ?? RECEIPT_RATE_LIMIT_MAX,
+    options.receiptRateLimit?.windowMs ?? RECEIPT_RATE_WINDOW_MS,
+  );
   const store = await openStore({
     databaseUrl: options.databaseUrl,
     sqlitePath: options.sqlitePath ?? ":memory:",
     mode,
+    receiptSigningKey: receiptKey,
   });
 
   app.addHook("onClose", async () => {
@@ -577,6 +599,97 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     await partyJob(request, id);
     const result = settled(await store.refundJob(id), "refunded");
     return publicJob(result.job, result, false);
+  });
+
+  function receiptUrlFor(request: FastifyRequest, id: string): string {
+    const configured = process.env.PUBLIC_BASE_URL?.trim().replace(/\/$/, "") ?? "";
+    if (configured) return `${configured}/r/${encodeURIComponent(id)}`;
+    const forwardedHost = headerValue(request.headers["x-forwarded-host"]);
+    const host = forwardedHost || headerValue(request.headers.host) || request.hostname;
+    const forwardedProto = headerValue(request.headers["x-forwarded-proto"]);
+    const proto = forwardedProto || request.protocol || "http";
+    return `${proto}://${host}/r/${encodeURIComponent(id)}`;
+  }
+
+  app.post("/v1/receipts", async (request, reply) => {
+    const decision = receiptLimiter.take(clientIp(request.headers["x-forwarded-for"], request.ip));
+    if (!decision.ok) {
+      return reply.status(429).header("retry-after", String(decision.retryAfterSec)).send({
+        error: {
+          code: "rate_limited",
+          message: "Too many receipt approvals from this address. Try again shortly.",
+        },
+      });
+    }
+    const body = asRecord(request.body);
+    rejectUnknown(body, [
+      "approver",
+      "approver_contact",
+      "agent_id",
+      "agent_name",
+      "merchant_name",
+      "merchant_url",
+      "scope",
+      "price_cap_amount",
+      "price_cap_currency",
+      "payment_rail",
+      "external_payment_ref",
+    ]);
+    const parsed = parseApprovalBody(body);
+    if (!parsed.ok) throw new ApiError(400, "bad_request", parsed.message);
+    const created = await store.createReceipt(parsed.value);
+    return reply.status(201).send({
+      ...toPublicReceipt(created.receipt, receiptUrlFor(request, created.receipt.id)),
+      edit_token: created.editToken,
+    });
+  });
+
+  app.post("/v1/receipts/:id/proof", async (request) => {
+    const { id } = request.params as { id: string };
+    const body = asRecord(request.body);
+    rejectUnknown(body, ["edit_token", "type", "value", "actual_amount", "status"]);
+    const parsed = parseProofBody(body);
+    if (!parsed.ok) throw new ApiError(400, "bad_request", parsed.message);
+    const result = await store.attachReceiptProof({ ...parsed.value, receiptId: id });
+    if (!result.ok) {
+      if (result.code === "not_found") throw new ApiError(404, "not_found", "Receipt not found");
+      if (result.code === "invalid_edit_token") throw new ApiError(403, "invalid_edit_token", "Edit token is invalid");
+      if (result.code === "tampered") {
+        throw new ApiError(409, "receipt_tampered", "Receipt no longer matches its hash chain");
+      }
+      throw new ApiError(409, "invalid_status", "Receipt status cannot move back from disputed");
+    }
+    return {
+      ...toPublicReceipt(result.receipt, receiptUrlFor(request, result.receipt.id)),
+      over_cap: result.over_cap,
+    };
+  });
+
+  app.get("/v1/receipts/:id/verify", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const receipt = await store.getReceipt(id);
+    if (!receipt) throw new ApiError(404, "not_found", "Receipt not found");
+    reply.header("cache-control", "no-store");
+    return verifyReceiptRecord(receipt, receiptKey);
+  });
+
+  app.get("/v1/receipts/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const receipt = await store.getReceipt(id);
+    if (!receipt) throw new ApiError(404, "not_found", "Receipt not found");
+    reply.header("cache-control", "no-store");
+    return toPublicReceipt(receipt, receiptUrlFor(request, receipt.id));
+  });
+
+  app.get("/r/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const receipt = await store.getReceipt(id);
+    if (!receipt) throw new ApiError(404, "not_found", "Receipt not found");
+    const verification = verifyReceiptRecord(receipt, receiptKey);
+    reply.header("cache-control", "no-store");
+    return reply
+      .type("text/html; charset=utf-8")
+      .send(renderReceiptPage(toPublicReceipt(receipt, receiptUrlFor(request, receipt.id)), verification));
   });
 
   app.get("/v1/purchases/:id", async (request) => {

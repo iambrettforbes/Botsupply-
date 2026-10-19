@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import type { AttachProofInput, CreateReceiptInput, ReceiptRecord } from "./receipts.js";
 import type { StripeMode } from "./stripe.js";
 
 export type StorageKind = "sqlite" | "postgres";
@@ -99,8 +100,17 @@ export type SettleJobResult =
   | { ok: false; code: "not_found" }
   | { ok: false; code: "not_held"; status: JobStatus };
 
+export type CreateReceiptResult = {
+  receipt: ReceiptRecord;
+  editToken: string;
+};
+
+export type AttachReceiptResult =
+  | { ok: true; receipt: ReceiptRecord; over_cap: boolean }
+  | { ok: false; code: "not_found" | "invalid_edit_token" | "invalid_status" | "tampered" };
+
 /**
- * Persistence for wallets, purchases, Checkout rows, and escrow jobs.
+ * Persistence for wallets, purchases, Checkout rows, escrow jobs, and purchase receipts.
  * Every read and write is limited to `mode` (dev, test, or live).
  */
 export type Store = {
@@ -133,6 +143,12 @@ export type Store = {
   releaseJob(id: string, feeBps: number): Promise<SettleJobResult>;
   /** Return the full held amount to the payer. */
   refundJob(id: string): Promise<SettleJobResult>;
+  /** Insert an approved receipt and its first hash-chain event. The edit token is returned once. */
+  createReceipt(input: CreateReceiptInput): Promise<CreateReceiptResult>;
+  /** Receipt in this store's mode, or undefined when the id is missing or belongs to another mode. */
+  getReceipt(id: string): Promise<ReceiptRecord | undefined>;
+  /** Append proof and a chain event when the edit token matches and the stored row still verifies. */
+  attachReceiptProof(input: AttachProofInput): Promise<AttachReceiptResult>;
 };
 
 export function hashApiKey(apiKey: string): string {
