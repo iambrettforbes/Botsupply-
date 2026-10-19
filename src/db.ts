@@ -1,14 +1,17 @@
 import { openPostgresStore } from "./postgres-store.js";
+import { loadReceiptSigningKey } from "./receipts.js";
 import { openSqliteStore } from "./sqlite-store.js";
 import type { StripeMode } from "./stripe.js";
 import type { Store } from "./store.js";
 
 export type {
   ApplyStripeCreditResult,
+  AttachReceiptResult,
   CheckoutSessionRow,
   CheckoutSessionSave,
   CreateJobInput,
   CreateJobResult,
+  CreateReceiptResult,
   JobBalances,
   JobRow,
   JobStatus,
@@ -27,12 +30,15 @@ export type OpenStoreOptions = {
   /** File path, or `:memory:`. Used when `databaseUrl` is unset. */
   sqlitePath: string;
   mode: StripeMode;
+  /** HMAC key for receipt hashes. Defaults to `RECEIPT_SIGNING_KEY` or an ephemeral dev key. */
+  receiptSigningKey?: Buffer;
 };
 
 /** Postgres when `databaseUrl` is non-empty. Otherwise the SQLite file. */
 export async function openStore(options: OpenStoreOptions): Promise<Store> {
   const databaseUrl = options.databaseUrl?.trim();
-  if (databaseUrl) return openPostgresStore(databaseUrl, options.mode);
+  const receiptSigningKey = options.receiptSigningKey ?? loadReceiptSigningKey();
+  if (databaseUrl) return openPostgresStore(databaseUrl, options.mode, receiptSigningKey);
   if (!options.sqlitePath) throw new Error("sqlitePath is required when DATABASE_URL is unset");
-  return openSqliteStore(options.sqlitePath, options.mode);
+  return openSqliteStore(options.sqlitePath, options.mode, receiptSigningKey);
 }

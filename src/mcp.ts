@@ -1,6 +1,19 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createMcpHandler, fromJsonSchema, McpServer, type AuthInfo } from "@modelcontextprotocol/server";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { ESCROW_AMOUNT_MAX, ESCROW_DESCRIPTION_MAX, ESCROW_IDEMPOTENCY_MAX } from "./escrow.js";
+import {
+  RECEIPT_AGENT_MAX,
+  RECEIPT_APPROVER_MAX,
+  RECEIPT_CONTACT_MAX,
+  RECEIPT_MERCHANT_MAX,
+  RECEIPT_PROOF_TYPE_MAX,
+  RECEIPT_PROOF_VALUE_MAX,
+  RECEIPT_RAIL_MAX,
+  RECEIPT_REF_MAX,
+  RECEIPT_SCOPE_MAX,
+  clientIp,
+} from "./receipts.js";
 import { CHECKOUT_MAX_CREDITS, CHECKOUT_MIN_CREDITS } from "./stripe.js";
 
 const SERVER_NAME = "botsupply";
@@ -13,6 +26,7 @@ const INSTRUCTIONS = [
   "Auth is a wallet API key: Authorization: Bearer on the MCP connection, or the api_key tool argument returned once by open_wallet.",
   "Credits are prepaid. create_checkout returns a Stripe Checkout URL when that route is configured. This server does not mint credits.",
   "create_job holds the caller's credits in escrow for another agent's wallet. release_job pays the payee when the work is delivered. refund_job returns the hold to the payer. The payer authorizes release and refund. The payee can also refund to cancel. A platform fee, ESCROW_FEE_BPS, defaults to 0 and is withheld from the payee only on release.",
+  "record_approval writes a public purchase receipt for a payment on any rail. BotSupply does not hold or move that money. attach_proof adds delivery proof with the edit_token from record_approval. get_receipt and verify_receipt are public.",
 ].join(" ");
 
 export type ApiResult = {
@@ -118,6 +132,126 @@ const jobIdSchema = fromJsonSchema<{ job_id: string; api_key?: string }>({
     api_key: apiKeySchema,
   },
   required: ["job_id"],
+  additionalProperties: false,
+});
+
+const recordApprovalSchema = fromJsonSchema<{
+  approver: string;
+  approver_contact?: string;
+  agent_id?: string;
+  agent_name?: string;
+  merchant_name: string;
+  merchant_url?: string;
+  scope: string;
+  price_cap_amount: number | string;
+  price_cap_currency: string;
+  payment_rail: string;
+  external_payment_ref?: string;
+}>({
+  type: "object",
+  properties: {
+    approver: {
+      type: "string",
+      maxLength: RECEIPT_APPROVER_MAX,
+      description: "Display name or handle of the human who approved the purchase.",
+    },
+    approver_contact: {
+      type: "string",
+      maxLength: RECEIPT_CONTACT_MAX,
+      description: "Optional email or phone. Stored only as a hash and never shown on the receipt.",
+    },
+    agent_id: {
+      type: "string",
+      maxLength: RECEIPT_AGENT_MAX,
+      description: "Optional id of the agent that will pay. Not a BotSupply API key.",
+    },
+    agent_name: {
+      type: "string",
+      maxLength: RECEIPT_AGENT_MAX,
+      description: "Optional display name of the paying agent.",
+    },
+    merchant_name: {
+      type: "string",
+      maxLength: RECEIPT_MERCHANT_MAX,
+      description: "Merchant or seller name.",
+    },
+    merchant_url: {
+      type: "string",
+      description: "Optional http or https URL for the merchant.",
+    },
+    scope: {
+      type: "string",
+      maxLength: RECEIPT_SCOPE_MAX,
+      description: "What the human approved, in plain text.",
+    },
+    price_cap_amount: {
+      anyOf: [{ type: "number", exclusiveMinimum: 0 }, { type: "string", minLength: 1, maxLength: 40 }],
+      description: "Maximum amount approved. A positive decimal, for example 25 or \"19.95\".",
+    },
+    price_cap_currency: {
+      type: "string",
+      description: "Currency code, 3 to 10 letters, for example USD or USDC.",
+    },
+    payment_rail: {
+      type: "string",
+      maxLength: RECEIPT_RAIL_MAX,
+      description: "How the agent will pay. Examples: stripe_link, card, x402, botsupply_wallet.",
+    },
+    external_payment_ref: {
+      type: "string",
+      maxLength: RECEIPT_REF_MAX,
+      description: "Optional id from the payment rail. BotSupply does not look it up.",
+    },
+  },
+  required: ["approver", "merchant_name", "scope", "price_cap_amount", "price_cap_currency", "payment_rail"],
+  additionalProperties: false,
+});
+
+const attachProofSchema = fromJsonSchema<{
+  receipt_id: string;
+  edit_token: string;
+  type: string;
+  value: string;
+  actual_amount?: number | string;
+  status?: "delivered" | "disputed";
+}>({
+  type: "object",
+  properties: {
+    receipt_id: { type: "string", description: "Receipt id from record_approval (rcpt_…)." },
+    edit_token: {
+      type: "string",
+      description: "Secret returned once by record_approval. Required to attach proof.",
+    },
+    type: {
+      type: "string",
+      maxLength: RECEIPT_PROOF_TYPE_MAX,
+      description: "Proof kind. Examples: order_confirmation, tracking, url, hash.",
+    },
+    value: {
+      type: "string",
+      maxLength: RECEIPT_PROOF_VALUE_MAX,
+      description: "The proof itself: confirmation id, tracking number, URL, or hash.",
+    },
+    actual_amount: {
+      anyOf: [{ type: "number", minimum: 0 }, { type: "string", minLength: 1, maxLength: 40 }],
+      description: "Amount actually charged. over_cap is true when this is above the price cap.",
+    },
+    status: {
+      type: "string",
+      enum: ["delivered", "disputed"],
+      description: "Omit to mark an approved receipt delivered. Pass disputed to dispute it.",
+    },
+  },
+  required: ["receipt_id", "edit_token", "type", "value"],
+  additionalProperties: false,
+});
+
+const receiptIdSchema = fromJsonSchema<{ receipt_id: string }>({
+  type: "object",
+  properties: {
+    receipt_id: { type: "string", description: "Public receipt id (rcpt_…)." },
+  },
+  required: ["receipt_id"],
   additionalProperties: false,
 });
 
@@ -368,6 +502,78 @@ function registerTools(server: McpServer, client: BotSupplyClient, defaultApiKey
       return fromApi(await client.post(`/v1/jobs/${encodeURIComponent(args.job_id)}/refund`, {}, apiKey));
     },
   );
+
+  server.registerTool(
+    "record_approval",
+    {
+      title: "Record purchase approval",
+      description:
+        "Record a human's approval of a purchase on any payment rail. BotSupply does not hold or move the money. Returns receipt_id, a public receipt_url, and an edit_token shown once. No wallet or API key. Rate limited per IP. Same as POST /v1/receipts.",
+      inputSchema: recordApprovalSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async (args) => {
+      const body: Record<string, unknown> = {
+        approver: args.approver,
+        merchant_name: args.merchant_name,
+        scope: args.scope,
+        price_cap_amount: args.price_cap_amount,
+        price_cap_currency: args.price_cap_currency,
+        payment_rail: args.payment_rail,
+      };
+      if (args.approver_contact !== undefined) body.approver_contact = args.approver_contact;
+      if (args.agent_id !== undefined) body.agent_id = args.agent_id;
+      if (args.agent_name !== undefined) body.agent_name = args.agent_name;
+      if (args.merchant_url !== undefined) body.merchant_url = args.merchant_url;
+      if (args.external_payment_ref !== undefined) body.external_payment_ref = args.external_payment_ref;
+      return fromApi(await client.post("/v1/receipts", body));
+    },
+  );
+
+  server.registerTool(
+    "attach_proof",
+    {
+      title: "Attach delivery proof",
+      description:
+        "Attach proof of delivery to a receipt. Requires the edit_token from record_approval. Moves approved to delivered, or to disputed when status is disputed. over_cap is true when actual_amount exceeds the price cap. Does not move money. Same as POST /v1/receipts/:id/proof.",
+      inputSchema: attachProofSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async (args) => {
+      const body: Record<string, unknown> = {
+        edit_token: args.edit_token,
+        type: args.type,
+        value: args.value,
+      };
+      if (args.actual_amount !== undefined) body.actual_amount = args.actual_amount;
+      if (args.status !== undefined) body.status = args.status;
+      return fromApi(await client.post(`/v1/receipts/${encodeURIComponent(args.receipt_id)}/proof`, body));
+    },
+  );
+
+  server.registerTool(
+    "get_receipt",
+    {
+      title: "Get purchase receipt",
+      description:
+        "Read a public purchase receipt: approval, scope, price cap, merchant, proofs, and content hash. No API key. The approver contact and the edit token are not included. Same as GET /v1/receipts/:id.",
+      inputSchema: receiptIdSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (args) => fromApi(await client.get(`/v1/receipts/${encodeURIComponent(args.receipt_id)}`)),
+  );
+
+  server.registerTool(
+    "verify_receipt",
+    {
+      title: "Verify purchase receipt",
+      description:
+        "Recompute the receipt hash chain and HMAC signature. valid is true when the stored receipt matches the chain and the server signature. valid is false when a row was altered. Same as GET /v1/receipts/:id/verify.",
+      inputSchema: receiptIdSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (args) => fromApi(await client.get(`/v1/receipts/${encodeURIComponent(args.receipt_id)}/verify`)),
+  );
 }
 
 function walletIdFromBalance(body: unknown): string | undefined {
@@ -434,6 +640,8 @@ export function createHttpClient(baseUrl: string): BotSupplyClient {
   };
 }
 
+const mcpClientIp = new AsyncLocalStorage<string>();
+
 export function createInjectClient(app: FastifyInstance): BotSupplyClient {
   const call = async (
     method: "GET" | "POST",
@@ -441,10 +649,14 @@ export function createInjectClient(app: FastifyInstance): BotSupplyClient {
     apiKey: string | undefined,
     payload?: Record<string, unknown>,
   ): Promise<ApiResult> => {
+    const headers: Record<string, string> = {};
+    if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+    const ip = mcpClientIp.getStore();
+    if (ip) headers["x-forwarded-for"] = ip;
     const response = await app.inject({
       method,
       url: path,
-      headers: apiKey ? { authorization: `Bearer ${apiKey}` } : undefined,
+      headers,
       payload,
     });
     return { ok: response.statusCode >= 200 && response.statusCode < 300, status: response.statusCode, body: parseBody(response.body) };
@@ -480,6 +692,8 @@ export function mountMcp(app: FastifyInstance): void {
   });
 
   app.all("/mcp", async (request: FastifyRequest, reply: FastifyReply) => {
+    const ip = clientIp(request.headers["x-forwarded-for"], request.ip);
+    return mcpClientIp.run(ip, async () => {
     const url = `${request.protocol}://${request.hostname}${request.url}`;
     const headers = new Headers();
     for (const [key, value] of Object.entries(request.headers)) {
@@ -513,5 +727,6 @@ export function mountMcp(app: FastifyInstance): void {
       return reply.type(contentType).send(JSON.parse(text) as unknown);
     }
     return reply.type(contentType).send(text);
+    });
   });
 }

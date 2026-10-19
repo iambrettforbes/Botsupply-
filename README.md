@@ -39,7 +39,7 @@ Open [http://127.0.0.1:4317](http://127.0.0.1:4317) for the price sheet and curl
 
 ## Data
 
-When `DATABASE_URL` is set, wallets, purchases, checkout sessions, credited Checkout sessions, and escrow jobs are stored in Postgres. Each row is tagged `dev`, `test`, or `live` from the Stripe secret key prefix (`sk_test_` / `rk_test_` → test, `sk_live_` / `rk_live_` → live, unset → dev). Every lookup includes that tag, so a test-mode process does not read live rows. The webhook accepts `checkout.session.completed` only when the event's `livemode` matches that tag.
+When `DATABASE_URL` is set, wallets, purchases, checkout sessions, credited Checkout sessions, escrow jobs, and purchase receipts are stored in Postgres. Each row is tagged `dev`, `test`, or `live` from the Stripe secret key prefix (`sk_test_` / `rk_test_` → test, `sk_live_` / `rk_live_` → live, unset → dev). Every lookup includes that tag, so a test-mode process does not read live rows. The webhook accepts `checkout.session.completed` only when the event's `livemode` matches that tag.
 
 When `DATABASE_URL` is unset, the same records stay in a SQLite file:
 
@@ -135,6 +135,28 @@ Release and refund move credits only while the status is `held`. A second releas
 
 `ESCROW_FEE_BPS` is an optional integer from 0 to 10000 (100 bps = 1%). The default is 0. On release the fee is `floor(amount_credits * ESCROW_FEE_BPS / 10000)`, recorded on the job as `fee_bps` and `fee_credits`, and credited to nobody. The payee receives `payee_credits` (`amount_credits - fee_credits`). Refunds return the full hold and charge no fee. While the job is held, `fee_credits` and `payee_credits` are 0.
 
+### Purchase receipts
+
+An agent can record a human's approval of a purchase on any payment rail and later attach proof of delivery. BotSupply stores the receipt and a public URL. It does not hold or move the money.
+
+`POST /v1/receipts` needs no wallet and no API key. It is limited to 30 approvals per minute per IP. The response includes `receipt_id` (`rcpt_` plus 24 hex characters), `receipt_url`, and `edit_token`. The edit token is returned once. Keep it. It is the only way to attach proof.
+
+```bash
+curl -s -X POST http://127.0.0.1:4317/v1/receipts \
+  -H 'content-type: application/json' \
+  -d '{"approver":"Ada","merchant_name":"North Market","scope":"Two bags of coffee","price_cap_amount":"25.00","price_cap_currency":"USD","payment_rail":"stripe_link"}'
+```
+
+`approver` is a display name or handle. Optional `approver_contact` (email or phone) is stored only as a SHA-256 hash and is never returned. `payment_rail` is free text such as `stripe_link`, `card`, `x402`, or `botsupply_wallet`. `price_cap_amount` is a positive decimal. Optional fields: `agent_id`, `agent_name`, `merchant_url` (http or https), `external_payment_ref`.
+
+`POST /v1/receipts/:id/proof` requires `edit_token`, `type` (`order_confirmation`, `tracking`, `url`, `hash`, or any other short label), and `value`. Optional `actual_amount` sets `over_cap` when it is above the price cap. The proof is still stored. The first proof moves `approved` to `delivered`. Pass `"status":"disputed"` to dispute. A disputed receipt cannot move back to delivered.
+
+`GET /v1/receipts/:id` is public JSON. `GET /v1/receipts/:id/verify` recomputes the hash chain and the HMAC signature and returns `valid` true or false. `GET /r/:id` is the same receipt as HTML, with a Verified or Tampered badge. None of these show `approver_contact` or the edit token.
+
+Each change hashes a canonical JSON snapshot with SHA-256. Every event stores `prev_hash` and `hash`. The receipt's `content_hash` is the latest event hash. That hash is signed with HMAC-SHA256 using `RECEIPT_SIGNING_KEY`. Set that variable to a long random secret. If it is unset, the process generates an ephemeral key and logs a warning. Signatures from that key do not verify after a restart. Changing the key makes older receipts verify as tampered.
+
+Receipts are scoped to the process Stripe mode, the same way wallets and jobs are.
+
 ### `POST /v1/purchase`
 
 Requires `Authorization: Bearer <api_key>`. Spends the SKU price and returns the JSON payload.
@@ -154,7 +176,7 @@ Replays a purchase for the wallet that owns it. Same bearer token as purchase.
 
 ### MCP
 
-`POST /mcp` is a stateless Streamable HTTP MCP server on this same process. The tools call the routes above (`list_catalog`, `open_wallet`, `get_balance`, `purchase`, `create_checkout`, `create_job`, `get_job`, `release_job`, `refund_job`). Install steps and auth: [MCP_INSTALL.md](MCP_INSTALL.md).
+`POST /mcp` is a stateless Streamable HTTP MCP server on this same process. The tools call the routes above (`list_catalog`, `open_wallet`, `get_balance`, `purchase`, `create_checkout`, `create_job`, `get_job`, `release_job`, `refund_job`, `record_approval`, `attach_proof`, `get_receipt`, `verify_receipt`). Install steps and auth: [MCP_INSTALL.md](MCP_INSTALL.md).
 
 ### `GET /health`
 
@@ -170,7 +192,7 @@ Replays a purchase for the wallet that owns it. Same bearer token as purchase.
 npm test
 ```
 
-Covers wallet creation, the DEV top-up, a purchase of each SKU, credit deduction, idempotent Stripe credit application, and escrow hold, release, refund, fee, idempotency, and mode isolation. Checkout tests use a fake Stripe client and do not call the network.
+Covers wallet creation, the DEV top-up, a purchase of each SKU, credit deduction, idempotent Stripe credit application, escrow hold, release, refund, fee, idempotency, and mode isolation, and purchase receipts (create, proof, verify, tamper, edit token, over-cap, mode isolation, and the per-IP approval limit). Checkout tests use a fake Stripe client and do not call the network.
 
 ## Deploy
 

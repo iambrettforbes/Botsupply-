@@ -266,6 +266,10 @@ curl -s -X POST "$BASE/v1/wallets/$WALLET_ID/checkout" \\
 curl -s -X POST "$BASE/v1/jobs/$JOB_ID/release" \\
   -H "authorization: Bearer $PAYER_API_KEY"</code></pre>
     </section>
+    <section>
+      <h2>Purchase receipts</h2>
+      <p class="note">Record a human's approval of a purchase on any rail. BotSupply does not hold or move the money. <code>POST /v1/receipts</code> needs no API key and returns an edit token once. The public page is <code>/r/:id</code>.</p>
+    </section>
     <footer>
       <span>1 credit = $${CREDIT_VALUE_USD.toFixed(2)} intended retail. Development top-ups are not invoiced.</span>
       <span>Postgres or SQLite · bind 0.0.0.0 · port $PORT or 4317</span>

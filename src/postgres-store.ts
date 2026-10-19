@@ -1,5 +1,15 @@
 import { Pool, type PoolClient } from "pg";
 import { clampFeeBps, escrowFeeCredits } from "./escrow.js";
+import {
+  assembleReceipt,
+  planApproval,
+  planProof,
+  type ReceiptEvent,
+  type ReceiptEventRow,
+  type ReceiptHeaderRow,
+  type ReceiptProofRow,
+  type ReceiptRecord,
+} from "./receipts.js";
 import type { StripeMode } from "./stripe.js";
 import {
   hashApiKey,
@@ -12,6 +22,7 @@ import {
   newId,
   sameJobRequest,
   type ApplyStripeCreditResult,
+  type AttachReceiptResult,
   type CheckoutSessionRow,
   type CheckoutSessionSave,
   type CreateJobInput,
@@ -77,6 +88,53 @@ const SCHEMA = [
     UNIQUE (mode, payer_wallet_id, idempotency_key)
   )`,
   `CREATE INDEX IF NOT EXISTS idx_escrow_jobs_mode_payer ON escrow_jobs (mode, payer_wallet_id)`,
+  `CREATE TABLE IF NOT EXISTS receipts (
+    id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    approver_name TEXT NOT NULL,
+    approver_contact_hash TEXT,
+    agent_id TEXT,
+    agent_name TEXT,
+    merchant_name TEXT NOT NULL,
+    merchant_url TEXT,
+    scope TEXT NOT NULL,
+    price_cap_amount TEXT NOT NULL,
+    price_cap_currency TEXT NOT NULL,
+    payment_rail TEXT NOT NULL,
+    external_payment_ref TEXT,
+    status TEXT NOT NULL CHECK (status IN ('approved', 'delivered', 'disputed')),
+    content_hash TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    edit_token_hash TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_receipts_mode_id ON receipts (mode, id)`,
+  `CREATE TABLE IF NOT EXISTS receipt_proofs (
+    id TEXT PRIMARY KEY,
+    receipt_id TEXT NOT NULL REFERENCES receipts(id),
+    mode TEXT NOT NULL,
+    proof_index INTEGER NOT NULL,
+    proof_type TEXT NOT NULL,
+    proof_value TEXT NOT NULL,
+    actual_amount TEXT,
+    over_cap INTEGER NOT NULL,
+    attached_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_receipt_proofs_receipt ON receipt_proofs (mode, receipt_id, proof_index)`,
+  `CREATE TABLE IF NOT EXISTS receipt_events (
+    id TEXT PRIMARY KEY,
+    receipt_id TEXT NOT NULL REFERENCES receipts(id),
+    mode TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    prev_hash TEXT NOT NULL,
+    hash TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (receipt_id, seq)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_receipt_events_receipt ON receipt_events (mode, receipt_id, seq)`,
 ];
 
 const JOB_COLUMNS =
@@ -122,7 +180,16 @@ async function withTransaction<T>(pool: Pool, run: (client: PoolClient) => Promi
   }
 }
 
-export async function openPostgresStore(connectionString: string, mode: StripeMode, pool = createPostgresPool(connectionString)): Promise<Store> {
+const RECEIPT_HEADER = `id, mode, created_at, updated_at, approver_name, approver_contact_hash, agent_id, agent_name,
+  merchant_name, merchant_url, scope, price_cap_amount, price_cap_currency, payment_rail,
+  external_payment_ref, status, content_hash, signature, edit_token_hash`;
+
+export async function openPostgresStore(
+  connectionString: string,
+  mode: StripeMode,
+  receiptKey: Buffer,
+  pool = createPostgresPool(connectionString),
+): Promise<Store> {
   try {
     for (const statement of SCHEMA) {
       await pool.query(statement);
@@ -487,7 +554,124 @@ export async function openPostgresStore(connectionString: string, mode: StripeMo
         })),
       );
     },
+    async createReceipt(input) {
+      const planned = planApproval(input, mode, new Date().toISOString(), receiptKey);
+      return withTransaction(pool, async (client) => {
+        await insertReceipt(client, planned.record);
+        await insertReceiptEvent(client, planned.record.id, planned.event);
+        const saved = await loadReceipt(client, planned.record.id);
+        if (!saved) throw new Error(`Receipt disappeared: ${planned.record.id}`);
+        return { receipt: saved, editToken: planned.editToken };
+      });
+    },
+    async getReceipt(id) {
+      return loadReceipt(pool, id);
+    },
+    async attachReceiptProof(input) {
+      return withTransaction(pool, async (client): Promise<AttachReceiptResult> => {
+        const locked = await client.query(`SELECT id FROM receipts WHERE id = $1 AND mode = $2 FOR UPDATE`, [
+          input.receiptId,
+          mode,
+        ]);
+        if (!locked.rows[0]) return { ok: false, code: "not_found" };
+        const current = await loadReceipt(client, input.receiptId);
+        if (!current) return { ok: false, code: "not_found" };
+        const planned = planProof(current, input, new Date().toISOString(), receiptKey);
+        if (!planned.ok) return planned;
+        await client.query(
+          `INSERT INTO receipt_proofs (
+             id, receipt_id, mode, proof_index, proof_type, proof_value, actual_amount, over_cap, attached_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            planned.proof.id,
+            input.receiptId,
+            mode,
+            planned.proof.proof_index,
+            planned.proof.type,
+            planned.proof.value,
+            planned.proof.actual_amount,
+            planned.proof.over_cap ? 1 : 0,
+            planned.proof.attached_at,
+          ],
+        );
+        await insertReceiptEvent(client, input.receiptId, planned.event);
+        const updated = await client.query(
+          `UPDATE receipts
+           SET status = $1, content_hash = $2, signature = $3, updated_at = $4
+           WHERE id = $5 AND mode = $6`,
+          [planned.status, planned.contentHash, planned.signature, planned.updatedAt, input.receiptId, mode],
+        );
+        if ((updated.rowCount ?? 0) !== 1) throw new Error(`Receipt update missed ${input.receiptId}`);
+        const saved = await loadReceipt(client, input.receiptId);
+        if (!saved) throw new Error(`Receipt disappeared: ${input.receiptId}`);
+        return { ok: true, receipt: saved, over_cap: planned.overCap };
+      });
+    },
   };
+
+  async function loadReceipt(client: Pool | PoolClient, id: string) {
+    const headerResult = await client.query(`SELECT ${RECEIPT_HEADER} FROM receipts WHERE id = $1 AND mode = $2`, [
+      id,
+      mode,
+    ]);
+    const header = headerResult.rows[0] as ReceiptHeaderRow | undefined;
+    if (!header) return undefined;
+    const proofResult = await client.query(
+      `SELECT id, proof_index, proof_type, proof_value, actual_amount, over_cap, attached_at
+       FROM receipt_proofs WHERE receipt_id = $1 AND mode = $2 ORDER BY proof_index ASC`,
+      [id, mode],
+    );
+    const eventResult = await client.query(
+      `SELECT id, seq, kind, prev_hash, hash, payload_json, created_at
+       FROM receipt_events WHERE receipt_id = $1 AND mode = $2 ORDER BY seq ASC`,
+      [id, mode],
+    );
+    return assembleReceipt(header, proofResult.rows as ReceiptProofRow[], eventResult.rows as ReceiptEventRow[]);
+  }
+
+  async function insertReceipt(client: PoolClient, record: ReceiptRecord): Promise<void> {
+    await client.query(
+      `INSERT INTO receipts (
+         id, mode, created_at, updated_at, approver_name, approver_contact_hash, agent_id, agent_name,
+         merchant_name, merchant_url, scope, price_cap_amount, price_cap_currency, payment_rail,
+         external_payment_ref, status, content_hash, signature, edit_token_hash
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
+      [
+        record.id,
+        mode,
+        record.created_at,
+        record.updated_at,
+        record.approver_name,
+        record.approver_contact_hash,
+        record.agent_id,
+        record.agent_name,
+        record.merchant_name,
+        record.merchant_url,
+        record.scope,
+        record.price_cap_amount,
+        record.price_cap_currency,
+        record.payment_rail,
+        record.external_payment_ref,
+        record.status,
+        record.content_hash,
+        record.signature,
+        record.edit_token_hash,
+      ],
+    );
+  }
+
+  async function insertReceiptEvent(
+    client: PoolClient,
+    receiptId: string,
+    event: ReceiptEvent,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO receipt_events (
+         id, receipt_id, mode, seq, kind, prev_hash, hash, payload_json, created_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [event.id, receiptId, mode, event.seq, event.kind, event.prev_hash, event.hash, event.payload_json, event.created_at],
+    );
+  }
 
   return store;
 }

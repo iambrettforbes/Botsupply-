@@ -2,6 +2,14 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { clampFeeBps, escrowFeeCredits } from "./escrow.js";
+import {
+  assembleReceipt,
+  planApproval,
+  planProof,
+  type ReceiptEventRow,
+  type ReceiptHeaderRow,
+  type ReceiptProofRow,
+} from "./receipts.js";
 import type { StripeMode } from "./stripe.js";
 import {
   hashApiKey,
@@ -13,10 +21,12 @@ import {
   newId,
   sameJobRequest,
   type ApplyStripeCreditResult,
+  type AttachReceiptResult,
   type CheckoutSessionRow,
   type CheckoutSessionSave,
   type CreateJobInput,
   type CreateJobResult,
+  type CreateReceiptResult,
   type JobBalances,
   type JobRow,
   type PurchaseResult,
@@ -79,6 +89,53 @@ const SCHEMA = `
     UNIQUE (mode, payer_wallet_id, idempotency_key)
   );
   CREATE INDEX IF NOT EXISTS idx_escrow_jobs_mode_payer ON escrow_jobs (mode, payer_wallet_id);
+  CREATE TABLE IF NOT EXISTS receipts (
+    id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    approver_name TEXT NOT NULL,
+    approver_contact_hash TEXT,
+    agent_id TEXT,
+    agent_name TEXT,
+    merchant_name TEXT NOT NULL,
+    merchant_url TEXT,
+    scope TEXT NOT NULL,
+    price_cap_amount TEXT NOT NULL,
+    price_cap_currency TEXT NOT NULL,
+    payment_rail TEXT NOT NULL,
+    external_payment_ref TEXT,
+    status TEXT NOT NULL CHECK (status IN ('approved', 'delivered', 'disputed')),
+    content_hash TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    edit_token_hash TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_receipts_mode_id ON receipts (mode, id);
+  CREATE TABLE IF NOT EXISTS receipt_proofs (
+    id TEXT PRIMARY KEY,
+    receipt_id TEXT NOT NULL REFERENCES receipts(id),
+    mode TEXT NOT NULL,
+    proof_index INTEGER NOT NULL,
+    proof_type TEXT NOT NULL,
+    proof_value TEXT NOT NULL,
+    actual_amount TEXT,
+    over_cap INTEGER NOT NULL,
+    attached_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_receipt_proofs_receipt ON receipt_proofs (mode, receipt_id, proof_index);
+  CREATE TABLE IF NOT EXISTS receipt_events (
+    id TEXT PRIMARY KEY,
+    receipt_id TEXT NOT NULL REFERENCES receipts(id),
+    mode TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    prev_hash TEXT NOT NULL,
+    hash TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (receipt_id, seq)
+  );
+  CREATE INDEX IF NOT EXISTS idx_receipt_events_receipt ON receipt_events (mode, receipt_id, seq);
 `;
 
 const JOB_SELECT = `id, payer_wallet_id, payee_wallet_id, amount_credits, description, status,
@@ -117,7 +174,11 @@ function openSqlite(sqlitePath: string): Database.Database {
   return db;
 }
 
-export function openSqliteStore(sqlitePath: string, mode: StripeMode): Store {
+const RECEIPT_HEADER = `id, mode, created_at, updated_at, approver_name, approver_contact_hash, agent_id, agent_name,
+  merchant_name, merchant_url, scope, price_cap_amount, price_cap_currency, payment_rail,
+  external_payment_ref, status, content_hash, signature, edit_token_hash`;
+
+export function openSqliteStore(sqlitePath: string, mode: StripeMode, receiptKey: Buffer): Store {
   const db = openSqlite(sqlitePath);
 
   function findWalletById(id: string): WalletRow | undefined {
@@ -332,7 +393,125 @@ export function openSqliteStore(sqlitePath: string, mode: StripeMode): Store {
       );
       return run.immediate();
     },
+    async createReceipt(input) {
+      const planned = planApproval(input, mode, new Date().toISOString(), receiptKey);
+      const run = db.transaction((): CreateReceiptResult => {
+        insertReceipt(planned.record);
+        insertReceiptEvent(planned.record.id, planned.event);
+        const saved = loadReceipt(planned.record.id);
+        if (!saved) throw new Error(`Receipt disappeared: ${planned.record.id}`);
+        return { receipt: saved, editToken: planned.editToken };
+      });
+      return run.immediate();
+    },
+    async getReceipt(id) {
+      return loadReceipt(id);
+    },
+    async attachReceiptProof(input) {
+      const run = db.transaction((): AttachReceiptResult => {
+        const current = loadReceipt(input.receiptId);
+        if (!current) return { ok: false, code: "not_found" };
+        const planned = planProof(current, input, new Date().toISOString(), receiptKey);
+        if (!planned.ok) return planned;
+        db.prepare(
+          `INSERT INTO receipt_proofs (
+             id, receipt_id, mode, proof_index, proof_type, proof_value, actual_amount, over_cap, attached_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          planned.proof.id,
+          input.receiptId,
+          mode,
+          planned.proof.proof_index,
+          planned.proof.type,
+          planned.proof.value,
+          planned.proof.actual_amount,
+          planned.proof.over_cap ? 1 : 0,
+          planned.proof.attached_at,
+        );
+        insertReceiptEvent(input.receiptId, planned.event);
+        const updated = db
+          .prepare(
+            `UPDATE receipts
+             SET status = ?, content_hash = ?, signature = ?, updated_at = ?
+             WHERE id = ? AND mode = ?`,
+          )
+          .run(planned.status, planned.contentHash, planned.signature, planned.updatedAt, input.receiptId, mode);
+        if (updated.changes !== 1) throw new Error(`Receipt update missed ${input.receiptId}`);
+        const saved = loadReceipt(input.receiptId);
+        if (!saved) throw new Error(`Receipt disappeared: ${input.receiptId}`);
+        return { ok: true, receipt: saved, over_cap: planned.overCap };
+      });
+      return run.immediate();
+    },
   };
+
+  function loadReceipt(id: string) {
+    const header = db
+      .prepare(`SELECT ${RECEIPT_HEADER} FROM receipts WHERE id = ? AND mode = ?`)
+      .get(id, mode) as ReceiptHeaderRow | undefined;
+    if (!header) return undefined;
+    const proofs = db
+      .prepare(
+        `SELECT id, proof_index, proof_type, proof_value, actual_amount, over_cap, attached_at
+         FROM receipt_proofs WHERE receipt_id = ? AND mode = ? ORDER BY proof_index ASC`,
+      )
+      .all(id, mode) as ReceiptProofRow[];
+    const events = db
+      .prepare(
+        `SELECT id, seq, kind, prev_hash, hash, payload_json, created_at
+         FROM receipt_events WHERE receipt_id = ? AND mode = ? ORDER BY seq ASC`,
+      )
+      .all(id, mode) as ReceiptEventRow[];
+    return assembleReceipt(header, proofs, events);
+  }
+
+  function insertReceipt(record: CreateReceiptResult["receipt"]): void {
+    db.prepare(
+      `INSERT INTO receipts (
+         id, mode, created_at, updated_at, approver_name, approver_contact_hash, agent_id, agent_name,
+         merchant_name, merchant_url, scope, price_cap_amount, price_cap_currency, payment_rail,
+         external_payment_ref, status, content_hash, signature, edit_token_hash
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      record.id,
+      mode,
+      record.created_at,
+      record.updated_at,
+      record.approver_name,
+      record.approver_contact_hash,
+      record.agent_id,
+      record.agent_name,
+      record.merchant_name,
+      record.merchant_url,
+      record.scope,
+      record.price_cap_amount,
+      record.price_cap_currency,
+      record.payment_rail,
+      record.external_payment_ref,
+      record.status,
+      record.content_hash,
+      record.signature,
+      record.edit_token_hash,
+    );
+  }
+
+  function insertReceiptEvent(receiptId: string, event: CreateReceiptResult["receipt"]["events"][number]): void {
+    db.prepare(
+      `INSERT INTO receipt_events (
+         id, receipt_id, mode, seq, kind, prev_hash, hash, payload_json, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      event.id,
+      receiptId,
+      mode,
+      event.seq,
+      event.kind,
+      event.prev_hash,
+      event.hash,
+      event.payload_json,
+      event.created_at,
+    );
+  }
 
   function selectJob(where: string, ...params: string[]): JobRow | undefined {
     const row = db.prepare(`SELECT ${JOB_SELECT} FROM escrow_jobs WHERE ${where}`).get(...params) as
