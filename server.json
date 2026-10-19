@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.iambrettforbes/botsupply",
+  "title": "BotSupply",
+  "description": "Verifiable purchase receipts for agents: record approval and proof. Wallets and escrow (test mode).",
+  "version": "1.1.0",
+  "websiteUrl": "https://github.com/iambrettforbes/Botsupply-",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://botsupply.onrender.com/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Optional. 'Bearer <wallet API key>' returned once by open_wallet. Required for get_balance, purchase, create_checkout unless api_key is passed as a tool argument.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

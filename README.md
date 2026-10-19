@@ -3,7 +3,7 @@
 [![iambrettforbes/Botsupply- MCP server](https://glama.ai/mcp/servers/iambrettforbes/Botsupply-/badges/score.svg)](https://glama.ai/mcp/servers/iambrettforbes/Botsupply-)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Free, rail-agnostic purchase receipts for AI agents.** Record a human's approval for a purchase on any payment rail, attach proof of delivery, and get a public, verifiable receipt URL. BotSupply never holds or moves the money, and receipts need no wallet.
+**Free, rail-agnostic purchase receipts for AI agents.** Record a human's approval for a purchase on any payment rail, attach proof of delivery, and get a public, verifiable receipt URL. Receipts do not hold or move the money, and they need no wallet.
 
 Also included (optional): prepaid credit wallets, agent-to-agent job escrow, and a small wholesale catalog.
 
@@ -48,9 +48,9 @@ Public HTML page: `GET /r/:id` (Verified or Tampered badge).
 | `open_wallet` | Create a wallet; API key returned once. |
 | `get_balance` | Prepaid credit balance. |
 | `purchase` | Buy one catalog SKU with credits. |
-| `create_checkout` | Stripe Checkout top-up (test mode; minimum 500 credits / $5). |
+| `create_checkout` | Stripe Checkout top-up (500 to 100000 credits, $5 to $1,000). Hosted service is Stripe test mode. |
 
-### Escrow (credits; test mode)
+### Escrow (prepaid credits)
 
 | Tool | What it does |
 | --- | --- |
@@ -81,13 +81,13 @@ curl -s -X POST https://botsupply.onrender.com/v1/receipts/$RECEIPT_ID/proof \
 - `GET /v1/receipts/:id/verify` — hash chain + HMAC check  
 - `GET /r/:id` — HTML with Verified / Tampered badge  
 
-Approvals are rate-limited (30/min/IP). Optional `approver_contact` is stored only as a SHA-256 hash and is never returned. Each change is hash-chained (SHA-256) and signed with HMAC-SHA256 using `RECEIPT_SIGNING_KEY`. Set that to a long random secret in production; if unset, an ephemeral key is generated and signatures will not verify after a restart.
+Approvals are rate-limited (30/min/IP). Optional `approver_contact` is stored only as a SHA-256 hash and is never returned. Each change is hash-chained (SHA-256). The latest hash is signed with HMAC-SHA256 using `RECEIPT_SIGNING_KEY`. Set that to a long random secret in production; if unset, an ephemeral key is generated and signatures will not verify after a restart. Changing the key makes older receipts verify as tampered.
 
 ## Wallets and credits
 
 **1 credit = $0.01 USD.** Agents open a wallet, top up with Stripe Checkout (test mode on the hosted service), and buy JSON products from the catalog.
 
-`POST /v1/wallets/:id/topup` is a free development top-up only when `STRIPE_SECRET_KEY` is unset. When Stripe is configured, that route returns **403** and agents pay with Checkout. Minimum paid top-up: **500 credits ($5)**.
+`POST /v1/wallets/:id/topup` is a free development top-up only when `STRIPE_SECRET_KEY` is unset. When `STRIPE_SECRET_KEY` is set, that route returns **403** and agents pay with Checkout. Paid top-ups are **500 to 100000 credits ($5 to $1,000)**.
 
 ### Catalog
 
@@ -97,7 +97,7 @@ Approvals are rate-limited (30/min/IP). Optional `approver_contact` is stored on
 | `pack.venue-hours` | pack | 20 | $0.20 |
 | `recipe.book-table` | recipe | 100 | $1.00 |
 
-`pack.competitor-snapshot` is a Cobble Hill casual-dining competitive set. `pack.venue-hours` is weekly hours and reservation policy for those venues. `recipe.book-table` is recipe documentation the agent runs itself (it does not place a reservation). Payloads are delivered on purchase.
+`pack.competitor-snapshot` is a Cobble Hill casual-dining competitive set. `pack.venue-hours` is weekly hours and reservation policy for those venues. `recipe.book-table` is an executable booking recipe the agent runs itself (buying it does not place a reservation). Payloads are delivered on purchase.
 
 ## Escrow jobs
 
@@ -131,7 +131,7 @@ Open [http://127.0.0.1:4317](http://127.0.0.1:4317) for the price sheet and curl
 
 ## Data
 
-When `DATABASE_URL` is set, wallets, purchases, checkout sessions, escrow jobs, and receipts are stored in **Postgres**. Each row is tagged `dev`, `test`, or `live` from the Stripe secret key prefix (`sk_test_` / `rk_test_` → test, `sk_live_` / `rk_live_` → live, unset → dev). Lookups include that tag, so test mode never reads live rows.
+When `DATABASE_URL` is set, wallets, purchases, checkout sessions, credited Checkout sessions, escrow jobs, and receipts are stored in **Postgres**. Each row is tagged `dev`, `test`, or `live` from the Stripe secret key prefix (`sk_test_` / `rk_test_` → test, `sk_live_` / `rk_live_` → live, unset → dev). Lookups include that tag, so test mode never reads live rows.
 
 When `DATABASE_URL` is unset, the same records stay in a **SQLite** file (`SQLITE_PATH`, or `/data/botsupply.sqlite` if writable, else `./data/botsupply.sqlite`).
 
@@ -156,7 +156,7 @@ The hosted service uses Postgres and reports `"storage":"postgres","mode":"test"
 | `POST` | `/v1/jobs/:id/release` | Release (auth) |
 | `POST` | `/v1/jobs/:id/refund` | Refund (auth) |
 | `POST` | `/mcp` | Streamable HTTP MCP |
-| `GET` | `/health` | `{ status, storage, mode, database }` |
+| `GET` | `/health` | `{ status, service, storage, mode, database }` (503 if the database ping fails) |
 
 Full curl examples for wallets, Checkout, Stripe webhook setup on Render, and escrow edge cases remain in git history and the install docs; the hosted service is the source of truth for live behavior.
 
