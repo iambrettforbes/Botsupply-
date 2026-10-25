@@ -28,6 +28,9 @@ const CONFIRM_TTL_MS_MAX = 30 * 24 * 60 * 60 * 1000;
 
 export type ReceiptStatus = "approved" | "delivered" | "disputed";
 
+/** Public display setting. Stored outside the hash snapshot. `full` is the default. */
+export type PublicView = "full" | "redacted";
+
 export type ReceiptEventKind =
   | "approved"
   | "proof_attached"
@@ -116,6 +119,16 @@ export type ReceiptRecord = {
    * Derived at read time from the confirm-token row. Not part of the hash snapshot.
    */
   email_approver: boolean;
+  /**
+   * How the public receipt is displayed. Not part of the hash snapshot.
+   * Changing it does not change the content hash or the signature.
+   */
+  public_view: PublicView;
+  /**
+   * Scope shown on the public receipt while `public_view` is `redacted`.
+   * Null means the stored scope is used. Not part of the hash snapshot.
+   */
+  public_scope: string | null;
   proofs: ReceiptProof[];
   payments: ReceiptPayment[];
   events: ReceiptEvent[];
@@ -174,6 +187,10 @@ export type PublicReceipt = {
   scope: string;
   price_cap: { amount: string; currency: string };
   payment_rail: string;
+  /**
+   * Latest recorded payment ref when any payment exists, otherwise the ref stored at approval.
+   * Derived at read time. The stored receipt column is not rewritten.
+   */
   external_payment_ref: string | null;
   proofs: PublicProof[];
   content_hash: string;
@@ -187,6 +204,18 @@ export type PublicReceipt = {
   pay_allowed: boolean;
   /** Set when the cap is at or above the threshold and no email approver contact was given. */
   confirm_notice: string | null;
+  /**
+   * True when any recorded payment was paid before confirmation.
+   * False when there are no payments or none were early. Derived at read time.
+   */
+  paid_before_confirmation: boolean;
+  /**
+   * True when any recorded payment exceeds the price cap.
+   * False when there are no payments or none are over the cap. Derived at read time.
+   */
+  over_cap: boolean;
+  /** Display setting. Not part of the signed record. */
+  public_view: PublicView;
   payments: PublicPayment[];
 };
 
@@ -205,6 +234,10 @@ export type CreateReceiptInput = {
   /** Set only when the contact is an email and a confirm link should be issued. */
   confirmContact: ConfirmContact | null;
   confirmationWebhookUrl: string | null;
+  /** Defaults to full. Not part of the hash snapshot. */
+  publicView?: PublicView;
+  /** Public scope used only while the receipt is redacted. Not part of the hash snapshot. */
+  publicScope?: string | null;
 };
 
 export type AttachProofInput = {
@@ -418,6 +451,53 @@ function maskPhone(phone: string): string {
 export function maskSensitiveText(value: string): string {
   const withoutEmail = value.replace(INLINE_EMAIL_RE, (match) => maskEmail(match.toLowerCase()));
   return withoutEmail.replace(INLINE_PHONE_RE, (match) => maskPhone(match));
+}
+
+/** Phrases such as "ending 1234", "ends in 4242", and "card ending 4242". */
+const CARD_ENDING_RE =
+  /\b(?:(?:card|visa|mastercard|amex|american\s+express|discover)\s+)?(?:ending|ends(?:\s+in|\s+with)?|last\s+4|last\s+four)\s*#?:?\s*\d{4}\b/gi;
+
+/** Masked card fragments such as ****4242 or xxxx-4242. */
+const MASKED_CARD_RE = /(?:[*xX•]{2,}[\s-]*)\d{4}\b/g;
+
+/**
+ * Remove emails, phone numbers, and card-ending phrases from public text.
+ * Display only. The stored string is unchanged.
+ */
+export function stripPrivateDetails(value: string): string {
+  const stripped = value
+    .replace(INLINE_EMAIL_RE, " ")
+    .replace(INLINE_PHONE_RE, " ")
+    .replace(CARD_ENDING_RE, " ")
+    .replace(MASKED_CARD_RE, " ");
+  return stripped
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\s+([,.;:])/g, "$1")
+    .replace(/([.,])(?:\s*[.,])+/g, "$1")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/,\s*,/g, ",")
+    .replace(/,\s*$/g, "")
+    .replace(/^\s*,\s*/g, "")
+    .trim();
+}
+
+/** Initials such as "Jane Doe" → "J.D.". Emails and phone numbers are dropped first. */
+export function approverInitials(name: string): string {
+  const stripped = stripPrivateDetails(name);
+  const initials: string[] = [];
+  for (const word of stripped.split(/\s+/)) {
+    if (!word) continue;
+    const match = /^[^A-Za-z]*([A-Za-z])/.exec(word);
+    if (match?.[1]) initials.push(`${match[1].toUpperCase()}.`);
+  }
+  return initials.join("");
+}
+
+/** Public stand-in for a payment ref or proof value: "on file" plus the last 4 remaining characters. */
+export function onFileTail(value: string): string {
+  const stripped = stripPrivateDetails(value).trim();
+  const tail = stripped.slice(-4);
+  return tail.length > 0 ? `on file ${tail}` : "on file";
 }
 
 const EMAIL_RE = /^[a-z0-9._%+-]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
@@ -811,6 +891,8 @@ export function planApproval(input: CreateReceiptInput, mode: StripeMode, now: s
     approver_decision_channel: null,
     approver_contact_masked: null,
     email_approver: input.confirmContact != null,
+    public_view: input.publicView ?? "full",
+    public_scope: input.publicScope ?? null,
     proofs: [],
     payments: [],
     events: [],
@@ -1017,6 +1099,24 @@ export function publicApproverConfirmation(record: ReceiptRecord): PublicApprove
   };
 }
 
+/** Public confirmation. Redacted receipts drop the masked contact so an email never appears. */
+export function publicConfirmationForRead(record: ReceiptRecord): PublicApproverConfirmation {
+  const confirmation = publicApproverConfirmation(record);
+  if (record.public_view !== "redacted") return confirmation;
+  return { ...confirmation, contact_masked: null };
+}
+
+/** Latest payment ref by payment_index, or the approval-time ref when nothing has been recorded. */
+export function displayedExternalPaymentRef(record: ReceiptRecord): string | null {
+  if (record.payments.length === 0) return record.external_payment_ref;
+  let latest = record.payments[0];
+  if (!latest) return record.external_payment_ref;
+  for (const payment of record.payments) {
+    if (payment.payment_index >= latest.payment_index) latest = payment;
+  }
+  return latest.external_payment_ref;
+}
+
 export function verifyReceiptRecord(record: ReceiptRecord, key: Buffer): VerifyResult {
   const checks: VerifyChecks = { chain: false, content: false, signature: false };
   const failed = (): VerifyResult => ({
@@ -1024,7 +1124,7 @@ export function verifyReceiptRecord(record: ReceiptRecord, key: Buffer): VerifyR
     receipt_id: record.id,
     content_hash: record.content_hash,
     checks,
-    approver_confirmation: publicApproverConfirmation(record),
+    approver_confirmation: publicConfirmationForRead(record),
   });
   if (record.events.length === 0) return failed();
   let previous = "";
@@ -1057,7 +1157,7 @@ export function verifyReceiptRecord(record: ReceiptRecord, key: Buffer): VerifyR
     receipt_id: record.id,
     content_hash: record.content_hash,
     checks,
-    approver_confirmation: publicApproverConfirmation(record),
+    approver_confirmation: publicConfirmationForRead(record),
   };
 }
 
@@ -1067,12 +1167,45 @@ function isChainBody(value: unknown, event: ReceiptEvent): value is ChainEventBo
   return body.seq === event.seq && body.kind === event.kind && body.prev_hash === event.prev_hash && body.snapshot != null;
 }
 
+function redactPublicReceipt(record: ReceiptRecord, receipt: PublicReceipt): PublicReceipt {
+  const hasAgent = Boolean(record.agent_name || record.agent_id);
+  const scopeSource = record.public_scope ?? record.scope;
+  const externalRef = displayedExternalPaymentRef(record);
+  return {
+    ...receipt,
+    approver: approverInitials(record.approver_name),
+    agent_id: null,
+    agent_name: hasAgent ? "Agent" : null,
+    merchant: { name: stripPrivateDetails(record.merchant_name), url: record.merchant_url },
+    scope: stripPrivateDetails(scopeSource),
+    payment_rail: stripPrivateDetails(record.payment_rail) || record.payment_rail,
+    external_payment_ref: externalRef == null ? null : onFileTail(externalRef),
+    proofs: record.proofs.map((proof) => ({
+      type: stripPrivateDetails(proof.type) || proof.type,
+      value: onFileTail(proof.value),
+      actual_amount: proof.actual_amount,
+      over_cap: proof.over_cap,
+      attached_at: proof.attached_at,
+    })),
+    approver_confirmation: publicConfirmationForRead(record),
+    payments: record.payments.map((payment) => ({
+      external_payment_ref: onFileTail(payment.external_payment_ref),
+      amount: payment.amount,
+      currency: payment.currency,
+      paid_at: payment.paid_at,
+      recorded_at: payment.recorded_at,
+      paid_before_confirmation: payment.paid_before_confirmation,
+      over_cap: payment.over_cap,
+    })),
+  };
+}
+
 export function toPublicReceipt(
   record: ReceiptRecord,
   receiptUrl: string,
   confirmThreshold = readConfirmThreshold(process.env.RECEIPT_CONFIRM_THRESHOLD),
 ): PublicReceipt {
-  return {
+  const receipt: PublicReceipt = {
     receipt_id: record.id,
     receipt_url: receiptUrl,
     mode: record.mode,
@@ -1086,7 +1219,7 @@ export function toPublicReceipt(
     scope: maskSensitiveText(record.scope),
     price_cap: { amount: record.price_cap_amount, currency: record.price_cap_currency },
     payment_rail: record.payment_rail,
-    external_payment_ref: record.external_payment_ref,
+    external_payment_ref: displayedExternalPaymentRef(record),
     proofs: record.proofs.map((proof) => ({
       type: proof.type,
       value: maskSensitiveText(proof.value),
@@ -1102,9 +1235,12 @@ export function toPublicReceipt(
       prev_hash: event.prev_hash,
       hash: event.hash,
     })),
-    approver_confirmation: publicApproverConfirmation(record),
+    approver_confirmation: publicConfirmationForRead(record),
     pay_allowed: receiptPayAllowed(record, confirmThreshold),
     confirm_notice: receiptConfirmNotice(record, confirmThreshold),
+    paid_before_confirmation: record.payments.some((payment) => payment.paid_before_confirmation),
+    over_cap: record.payments.some((payment) => payment.over_cap),
+    public_view: record.public_view,
     payments: record.payments.map((payment) => ({
       external_payment_ref: payment.external_payment_ref,
       amount: payment.amount,
@@ -1115,6 +1251,8 @@ export function toPublicReceipt(
       over_cap: payment.over_cap,
     })),
   };
+  if (record.public_view !== "redacted") return receipt;
+  return redactPublicReceipt(record, receipt);
 }
 
 export type Parsed<T> = { ok: true; value: T } | { ok: false; message: string };
@@ -1175,6 +1313,10 @@ export function parseApprovalBody(body: Record<string, unknown>): Parsed<CreateR
   if (!rail.ok) return rail;
   const externalRef = optionalText(body.external_payment_ref, "external_payment_ref", RECEIPT_REF_MAX);
   if (!externalRef.ok) return externalRef;
+  const publicView = parsePublicView(body.public_view, true);
+  if (!publicView.ok) return publicView;
+  const publicScope = optionalText(body.public_scope, "public_scope", RECEIPT_SCOPE_MAX);
+  if (!publicScope.ok) return publicScope;
   let confirmationWebhookUrl: string | null = null;
   if (body.confirmation_webhook_url != null) {
     if (typeof body.confirmation_webhook_url !== "string") {
@@ -1203,7 +1345,47 @@ export function parseApprovalBody(body: Record<string, unknown>): Parsed<CreateR
       priceCapCurrency: canonicalizeCurrency(body.price_cap_currency) ?? "",
       paymentRail: rail.value,
       externalPaymentRef: externalRef.value,
+      publicView: publicView.value,
+      publicScope: publicScope.value,
     },
+  };
+}
+
+function parsePublicView(value: unknown, allowMissing: boolean): Parsed<PublicView> {
+  if (value == null) {
+    if (allowMissing) return { ok: true, value: "full" };
+    return { ok: false, message: "public_view must be full or redacted" };
+  }
+  if (value === "full" || value === "redacted") return { ok: true, value };
+  return { ok: false, message: "public_view must be full or redacted" };
+}
+
+export type VisibilityInput = {
+  editToken: string;
+  publicView: PublicView;
+  /** Undefined leaves the stored public scope unchanged. Null clears it. */
+  publicScope?: string | null;
+};
+
+export function parseVisibilityBody(body: Record<string, unknown>): Parsed<VisibilityInput> {
+  const token = requiredText(body.edit_token, "edit_token", 200);
+  if (!token.ok) return token;
+  const publicView = parsePublicView(body.public_view, false);
+  if (!publicView.ok) return publicView;
+  if (!Object.prototype.hasOwnProperty.call(body, "public_scope")) {
+    return { ok: true, value: { editToken: token.value, publicView: publicView.value } };
+  }
+  if (body.public_scope == null) {
+    return { ok: true, value: { editToken: token.value, publicView: publicView.value, publicScope: null } };
+  }
+  const publicScope = optionalText(body.public_scope, "public_scope", RECEIPT_SCOPE_MAX);
+  if (!publicScope.ok) return publicScope;
+  if (publicScope.value == null) {
+    return { ok: false, message: "public_scope must be a string of 1 to 2000 characters" };
+  }
+  return {
+    ok: true,
+    value: { editToken: token.value, publicView: publicView.value, publicScope: publicScope.value },
   };
 }
 
@@ -1376,6 +1558,8 @@ export type ReceiptHeaderRow = {
   approver_decision_at?: string | Date | null;
   approver_decision_channel?: string | null;
   approver_contact_masked?: string | null;
+  public_view?: string | null;
+  public_scope?: string | null;
 };
 
 export type ReceiptProofRow = {
@@ -1451,6 +1635,8 @@ export function assembleReceipt(
     approver_decision_channel: header.approver_decision_channel ? asContactChannel(header.approver_decision_channel) : null,
     approver_contact_masked: header.approver_contact_masked ?? null,
     email_approver: emailApprover,
+    public_view: header.public_view === "redacted" ? "redacted" : "full",
+    public_scope: header.public_scope ?? null,
     proofs: proofs.map((proof) => ({
       id: proof.id,
       proof_index: Number(proof.proof_index),

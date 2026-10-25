@@ -11,6 +11,7 @@ import {
   hashConfirmToken,
   isConfirmToken,
   newConfirmToken,
+  editTokenMatches,
   planApproval,
   planApproverDecision,
   planPayment,
@@ -40,6 +41,7 @@ import {
   type DecideConfirmationResult,
   type ReadConfirmationResult,
   type RecordPaymentResult,
+  type SetReceiptVisibilityResult,
   type JobBalances,
   type JobRow,
   type PurchaseResult,
@@ -125,7 +127,9 @@ const SCHEMA = `
     approver_decision TEXT,
     approver_decision_at TEXT,
     approver_decision_channel TEXT,
-    approver_contact_masked TEXT
+    approver_contact_masked TEXT,
+    public_view TEXT NOT NULL DEFAULT 'full',
+    public_scope TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_receipts_mode_id ON receipts (mode, id);
   CREATE TABLE IF NOT EXISTS receipt_proofs (
@@ -231,16 +235,21 @@ function migrateReceiptConfirmation(db: Database.Database): void {
     "approver_decision_at",
     "approver_decision_channel",
     "approver_contact_masked",
+    "public_scope",
   ]) {
     if (columns.includes(column)) continue;
     db.exec(`ALTER TABLE receipts ADD COLUMN ${column} TEXT`);
+  }
+  if (!columns.includes("public_view")) {
+    db.exec(`ALTER TABLE receipts ADD COLUMN public_view TEXT NOT NULL DEFAULT 'full'`);
   }
 }
 
 const RECEIPT_HEADER = `id, mode, created_at, updated_at, approver_name, approver_contact_hash, agent_id, agent_name,
   merchant_name, merchant_url, scope, price_cap_amount, price_cap_currency, payment_rail,
   external_payment_ref, status, content_hash, signature, edit_token_hash,
-  approver_decision, approver_decision_at, approver_decision_channel, approver_contact_masked`;
+  approver_decision, approver_decision_at, approver_decision_channel, approver_contact_masked,
+  public_view, public_scope`;
 
 type ConfirmTokenRow = {
   receipt_id: string;
@@ -542,6 +551,33 @@ export function openSqliteStore(
       });
       return run.immediate();
     },
+    async setReceiptVisibility(input) {
+      const run = db.transaction((): SetReceiptVisibilityResult => {
+        const current = loadReceipt(input.receiptId);
+        if (!current) return { ok: false, code: "not_found" };
+        if (!editTokenMatches(current.edit_token_hash, input.editToken)) {
+          return { ok: false, code: "invalid_edit_token" };
+        }
+        if (input.publicScope === undefined) {
+          db.prepare(`UPDATE receipts SET public_view = ? WHERE id = ? AND mode = ?`).run(
+            input.publicView,
+            input.receiptId,
+            mode,
+          );
+        } else {
+          db.prepare(`UPDATE receipts SET public_view = ?, public_scope = ? WHERE id = ? AND mode = ?`).run(
+            input.publicView,
+            input.publicScope,
+            input.receiptId,
+            mode,
+          );
+        }
+        const saved = loadReceipt(input.receiptId);
+        if (!saved) throw new Error(`Receipt disappeared: ${input.receiptId}`);
+        return { ok: true, receipt: saved };
+      });
+      return run.immediate();
+    },
     async attachReceiptProof(input) {
       const run = db.transaction((): AttachReceiptResult => {
         const current = loadReceipt(input.receiptId);
@@ -737,8 +773,9 @@ export function openSqliteStore(
       `INSERT INTO receipts (
          id, mode, created_at, updated_at, approver_name, approver_contact_hash, agent_id, agent_name,
          merchant_name, merchant_url, scope, price_cap_amount, price_cap_currency, payment_rail,
-         external_payment_ref, status, content_hash, signature, edit_token_hash
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         external_payment_ref, status, content_hash, signature, edit_token_hash,
+         public_view, public_scope
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       record.id,
       mode,
@@ -759,6 +796,8 @@ export function openSqliteStore(
       record.content_hash,
       record.signature,
       record.edit_token_hash,
+      record.public_view,
+      record.public_scope,
     );
   }
 

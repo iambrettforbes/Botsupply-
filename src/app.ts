@@ -25,6 +25,7 @@ import {
   parseApprovalBody,
   parsePaymentBody,
   parseProofBody,
+  parseVisibilityBody,
   publicApproverConfirmation,
   readConfirmThreshold,
   readConfirmTtlMs,
@@ -710,6 +711,8 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
       "payment_rail",
       "external_payment_ref",
       "confirmation_webhook_url",
+      "public_view",
+      "public_scope",
     ]);
     const parsed = parseApprovalBody(body);
     if (!parsed.ok) throw new ApiError(400, "bad_request", parsed.message);
@@ -783,11 +786,26 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
       if (result.code === "invalid_edit_token") throw new ApiError(403, "invalid_edit_token", "Edit token is invalid");
       throw new ApiError(409, "receipt_tampered", "Receipt no longer matches its hash chain");
     }
-    return {
-      ...publicReceipt(request, result.receipt),
-      paid_before_confirmation: result.paid_before_confirmation,
-      over_cap: result.over_cap,
-    };
+    return publicReceipt(request, result.receipt);
+  });
+
+  app.post("/v1/receipts/:id/visibility", async (request) => {
+    const { id } = request.params as { id: string };
+    const body = asRecord(request.body);
+    rejectUnknown(body, ["edit_token", "public_view", "public_scope"]);
+    const parsed = parseVisibilityBody(body);
+    if (!parsed.ok) throw new ApiError(400, "bad_request", parsed.message);
+    const result = await store.setReceiptVisibility({
+      receiptId: id,
+      editToken: parsed.value.editToken,
+      publicView: parsed.value.publicView,
+      publicScope: parsed.value.publicScope,
+    });
+    if (!result.ok) {
+      if (result.code === "not_found") throw new ApiError(404, "not_found", "Receipt not found");
+      throw new ApiError(403, "invalid_edit_token", "Edit token is invalid");
+    }
+    return publicReceipt(request, result.receipt);
   });
 
   app.get("/v1/receipts/:id/verify", async (request, reply) => {

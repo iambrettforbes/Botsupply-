@@ -31,6 +31,8 @@ type ReceiptBody = {
   scope: string;
   pay_allowed: boolean;
   confirm_notice: string | null;
+  external_payment_ref: string | null;
+  public_view?: string;
   merchant: { name: string };
   price_cap: { amount: string; currency: string };
   approver_confirmation: { status: string; at: string | null };
@@ -154,6 +156,8 @@ test("approval snapshots stay free of payment fields", () => {
       priceCapCurrency: "USD",
       paymentRail: "card",
       externalPaymentRef: null,
+      publicView: "redacted",
+      publicScope: "Coffee, no contact details",
     },
     "dev",
     "2026-01-01T00:00:00.000Z",
@@ -162,6 +166,9 @@ test("approval snapshots stay free of payment fields", () => {
   assert.equal(planned.event.payload_json.includes("payments"), false);
   assert.equal(planned.event.payload_json.includes("pay_allowed"), false);
   assert.equal(planned.event.payload_json.includes("email_approver"), false);
+  assert.equal(planned.event.payload_json.includes("public_view"), false);
+  assert.equal(planned.event.payload_json.includes("public_scope"), false);
+  assert.equal(planned.record.public_view, "redacted");
   assert.equal(planned.record.payments.length, 0);
 });
 
@@ -245,13 +252,21 @@ test("record_payment appends a flagged chain event and does not reject early or 
     assert.equal(earlyBody.payments[0]?.amount, "30");
     assert.equal(earlyBody.payments[0]?.currency, "USD");
     assert.equal(earlyBody.payments[0]?.external_payment_ref, "pi_early");
+    assert.equal(earlyBody.external_payment_ref, "pi_early");
     assert.equal(earlyBody.timeline.at(-1)?.kind, "payment_recorded");
     assert.equal(earlyBody.timeline.at(-1)?.prev_hash, receipt.content_hash);
     assert.equal(early.body.includes(receipt.edit_token ?? "missing"), false);
     assert.equal(earlyBody.status, "approved");
     const earlyVerify = await app.inject({ method: "GET", url: `/v1/receipts/${receipt.receipt_id}/verify` });
     assert.equal((earlyVerify.json() as VerifyBody).valid, true);
+    const earlyRead = await app.inject({ method: "GET", url: `/v1/receipts/${receipt.receipt_id}` });
+    const earlyReadBody = earlyRead.json() as ReceiptBody;
+    assert.equal(earlyReadBody.external_payment_ref, "pi_early");
+    assert.equal(earlyReadBody.paid_before_confirmation, true);
+    assert.equal(earlyReadBody.over_cap, true);
     const earlyPage = await app.inject({ method: "GET", url: `/r/${receipt.receipt_id}` });
+    assert.match(earlyPage.body, /<dt>Payment ref<\/dt><dd>pi_early<\/dd>/);
+    assert.doesNotMatch(earlyPage.body, /<dt>Payment ref<\/dt><dd>None<\/dd>/);
     assert.match(earlyPage.body, /Paid before confirmation/);
     assert.match(earlyPage.body, /Over approved cap/);
     assert.doesNotMatch(earlyPage.body, /Confirmed before payment/);
@@ -490,12 +505,12 @@ test("a tampered receipt is not re-signed by record_payment", async () => {
   }
 });
 
-test("MCP record_payment is the fourteenth tool and follows pay_allowed", async () => {
+test("MCP record_payment is one of fifteen tools and follows pay_allowed", async () => {
   const app = await appWith();
   try {
     const listed = await rpc(app, "tools/list", {});
     const tools = listed.result?.tools ?? [];
-    assert.equal(tools.length, 14);
+    assert.equal(tools.length, 15);
     const payment = tools.find((tool) => tool.name === "record_payment");
     const getReceipt = tools.find((tool) => tool.name === "get_receipt");
     assert.match(payment?.description ?? "", /payment_recorded/);

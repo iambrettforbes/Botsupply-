@@ -68,6 +68,7 @@ test("MCP tools list the live catalog and do not invent a reservation tool", asy
       "record_payment",
       "refund_job",
       "release_job",
+      "set_receipt_visibility",
       "verify_receipt",
     ]);
     const createJob = listed.result?.tools?.find((tool) => tool.name === "create_job");
