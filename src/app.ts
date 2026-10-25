@@ -23,8 +23,10 @@ import {
   clientIp,
   createRateLimiter,
   parseApprovalBody,
+  parsePaymentBody,
   parseProofBody,
   publicApproverConfirmation,
+  readConfirmThreshold,
   readConfirmTtlMs,
   redactConfirmToken,
   resolveReceiptSigningKey,
@@ -62,6 +64,8 @@ export type BuildOptions = {
   receiptRateLimit?: { max: number; windowMs: number };
   /** Life of a confirm link. Overrides `RECEIPT_CONFIRM_TTL_SECONDS`. */
   confirmTtlMs?: number;
+  /** Price-cap units at or above which a receipt with no email approver contact cannot be paid. Overrides `RECEIPT_CONFIRM_THRESHOLD`. */
+  confirmThreshold?: string;
   /** Overrides the per-IP limit on `/c/:token`. */
   confirmRateLimit?: { max: number; windowMs: number };
   /** Overrides the env email notifier. Unconfigured notifiers do not send. */
@@ -297,6 +301,7 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
   const notifier = options.approvalNotifier ?? approvalNotifierFromEnv();
   const confirmationWebhook = options.confirmationWebhook ?? liveConfirmationWebhook();
   readConfirmTtlMs(process.env.RECEIPT_CONFIRM_TTL_SECONDS, options.confirmTtlMs);
+  const confirmThreshold = readConfirmThreshold(process.env.RECEIPT_CONFIRM_THRESHOLD, options.confirmThreshold);
   const store = await openStore({
     databaseUrl: options.databaseUrl,
     sqlitePath: options.sqlitePath ?? ":memory:",
@@ -662,6 +667,10 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     return `${publicOrigin(request)}/r/${encodeURIComponent(id)}`;
   }
 
+  function publicReceipt(request: FastifyRequest, receipt: Parameters<typeof toPublicReceipt>[0]) {
+    return toPublicReceipt(receipt, receiptUrlFor(request, receipt.id), confirmThreshold);
+  }
+
   function confirmUrlFor(request: FastifyRequest, token: string): string {
     return `${publicOrigin(request)}/c/${encodeURIComponent(token)}`;
   }
@@ -706,7 +715,7 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     if (!parsed.ok) throw new ApiError(400, "bad_request", parsed.message);
     const created = await store.createReceipt(parsed.value);
     const payload: Record<string, unknown> = {
-      ...toPublicReceipt(created.receipt, receiptUrlFor(request, created.receipt.id)),
+      ...publicReceipt(request, created.receipt),
       edit_token: created.editToken,
     };
     if (created.confirmation) {
@@ -757,7 +766,26 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
       throw new ApiError(409, "invalid_status", "Receipt status cannot move back from disputed");
     }
     return {
-      ...toPublicReceipt(result.receipt, receiptUrlFor(request, result.receipt.id)),
+      ...publicReceipt(request, result.receipt),
+      over_cap: result.over_cap,
+    };
+  });
+
+  app.post("/v1/receipts/:id/payment", async (request) => {
+    const { id } = request.params as { id: string };
+    const body = asRecord(request.body);
+    rejectUnknown(body, ["edit_token", "external_payment_ref", "amount", "paid_at"]);
+    const parsed = parsePaymentBody(body);
+    if (!parsed.ok) throw new ApiError(400, "bad_request", parsed.message);
+    const result = await store.recordReceiptPayment({ ...parsed.value, receiptId: id });
+    if (!result.ok) {
+      if (result.code === "not_found") throw new ApiError(404, "not_found", "Receipt not found");
+      if (result.code === "invalid_edit_token") throw new ApiError(403, "invalid_edit_token", "Edit token is invalid");
+      throw new ApiError(409, "receipt_tampered", "Receipt no longer matches its hash chain");
+    }
+    return {
+      ...publicReceipt(request, result.receipt),
+      paid_before_confirmation: result.paid_before_confirmation,
       over_cap: result.over_cap,
     };
   });
@@ -775,7 +803,7 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     const receipt = await store.getReceipt(id);
     if (!receipt) throw new ApiError(404, "not_found", "Receipt not found");
     reply.header("cache-control", "no-store");
-    return toPublicReceipt(receipt, receiptUrlFor(request, receipt.id));
+    return publicReceipt(request, receipt);
   });
 
   function confirmLimited(request: FastifyRequest, reply: FastifyReply): boolean {
@@ -887,7 +915,7 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     reply.header("cache-control", "no-store");
     return reply
       .type("text/html; charset=utf-8")
-      .send(renderReceiptPage(toPublicReceipt(receipt, receiptUrlFor(request, receipt.id)), verification));
+      .send(renderReceiptPage(publicReceipt(request, receipt), verification));
   });
 
   app.get("/v1/purchases/:id", async (request) => {

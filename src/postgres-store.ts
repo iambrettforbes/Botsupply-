@@ -11,11 +11,13 @@ import {
   newConfirmToken,
   planApproval,
   planApproverDecision,
+  planPayment,
   planProof,
   type CreateReceiptInput,
   type ReceiptEvent,
   type ReceiptEventRow,
   type ReceiptHeaderRow,
+  type ReceiptPaymentRow,
   type ReceiptProofRow,
   type ReceiptRecord,
 } from "./receipts.js";
@@ -40,6 +42,7 @@ import {
   type DecideConfirmationResult,
   type JobBalances,
   type ReadConfirmationResult,
+  type RecordPaymentResult,
   type JobRow,
   type PurchaseResult,
   type SettleJobResult,
@@ -170,6 +173,21 @@ const SCHEMA = [
     created_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_receipt_confirm_tokens_receipt ON receipt_confirm_tokens (mode, receipt_id)`,
+  `CREATE TABLE IF NOT EXISTS receipt_payments (
+    id TEXT PRIMARY KEY,
+    receipt_id TEXT NOT NULL REFERENCES receipts(id),
+    mode TEXT NOT NULL,
+    payment_index INTEGER NOT NULL,
+    external_payment_ref TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    paid_at TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    paid_before_confirmation INTEGER NOT NULL,
+    over_cap INTEGER NOT NULL,
+    UNIQUE (receipt_id, payment_index)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_receipt_payments_receipt ON receipt_payments (mode, receipt_id, payment_index)`,
 ];
 
 const JOB_COLUMNS =
@@ -615,6 +633,65 @@ export async function openPostgresStore(
     async getReceipt(id) {
       return loadReceipt(pool, id);
     },
+    async recordReceiptPayment(input) {
+      return withTransaction(pool, async (client): Promise<RecordPaymentResult> => {
+        const locked = await client.query(`SELECT id FROM receipts WHERE id = $1 AND mode = $2 FOR UPDATE`, [
+          input.receiptId,
+          mode,
+        ]);
+        if (!locked.rows[0]) return { ok: false, code: "not_found" };
+        const current = await loadReceipt(client, input.receiptId);
+        if (!current) return { ok: false, code: "not_found" };
+        const now = new Date().toISOString();
+        const planned = planPayment(
+          current,
+          {
+            editToken: input.editToken,
+            externalPaymentRef: input.externalPaymentRef,
+            amount: input.amount,
+            paidAt: input.paidAt ?? now,
+          },
+          now,
+          receiptKey,
+        );
+        if (!planned.ok) return planned;
+        await client.query(
+          `INSERT INTO receipt_payments (
+             id, receipt_id, mode, payment_index, external_payment_ref, amount, currency,
+             paid_at, recorded_at, paid_before_confirmation, over_cap
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+          [
+            planned.payment.id,
+            input.receiptId,
+            mode,
+            planned.payment.payment_index,
+            planned.payment.external_payment_ref,
+            planned.payment.amount,
+            planned.payment.currency,
+            planned.payment.paid_at,
+            planned.payment.recorded_at,
+            planned.payment.paid_before_confirmation ? 1 : 0,
+            planned.payment.over_cap ? 1 : 0,
+          ],
+        );
+        await insertReceiptEvent(client, input.receiptId, planned.event);
+        const updated = await client.query(
+          `UPDATE receipts
+           SET content_hash = $1, signature = $2, updated_at = $3
+           WHERE id = $4 AND mode = $5`,
+          [planned.contentHash, planned.signature, planned.updatedAt, input.receiptId, mode],
+        );
+        if ((updated.rowCount ?? 0) !== 1) throw new Error(`Receipt payment update missed ${input.receiptId}`);
+        const saved = await loadReceipt(client, input.receiptId);
+        if (!saved) throw new Error(`Receipt disappeared: ${input.receiptId}`);
+        return {
+          ok: true,
+          receipt: saved,
+          paid_before_confirmation: planned.paidBeforeConfirmation,
+          over_cap: planned.overCap,
+        };
+      });
+    },
     async attachReceiptProof(input) {
       return withTransaction(pool, async (client): Promise<AttachReceiptResult> => {
         const locked = await client.query(`SELECT id FROM receipts WHERE id = $1 AND mode = $2 FOR UPDATE`, [
@@ -805,7 +882,23 @@ export async function openPostgresStore(
        FROM receipt_events WHERE receipt_id = $1 AND mode = $2 ORDER BY seq ASC`,
       [id, mode],
     );
-    return assembleReceipt(header, proofResult.rows as ReceiptProofRow[], eventResult.rows as ReceiptEventRow[]);
+    const paymentResult = await client.query(
+      `SELECT id, payment_index, external_payment_ref, amount, currency, paid_at, recorded_at,
+              paid_before_confirmation, over_cap
+       FROM receipt_payments WHERE receipt_id = $1 AND mode = $2 ORDER BY payment_index ASC`,
+      [id, mode],
+    );
+    const emailResult = await client.query(
+      `SELECT 1 AS present FROM receipt_confirm_tokens WHERE receipt_id = $1 AND mode = $2 LIMIT 1`,
+      [id, mode],
+    );
+    return assembleReceipt(
+      header,
+      proofResult.rows as ReceiptProofRow[],
+      eventResult.rows as ReceiptEventRow[],
+      paymentResult.rows as ReceiptPaymentRow[],
+      Boolean(emailResult.rows[0]),
+    );
   }
 
   async function insertReceipt(client: PoolClient, record: ReceiptRecord): Promise<void> {

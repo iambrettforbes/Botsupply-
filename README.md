@@ -27,7 +27,7 @@ claude mcp add --transport http botsupply 'https://botsupply.onrender.com/mcp'
 
 Install notes and auth: [MCP_INSTALL.md](MCP_INSTALL.md). REST agents: [AGENT_INSTALL.md](AGENT_INSTALL.md). Demo script: [DEMO.md](DEMO.md).
 
-## MCP tools (13)
+## MCP tools (14)
 
 ### Purchase receipts (no wallet, free)
 
@@ -35,7 +35,8 @@ Install notes and auth: [MCP_INSTALL.md](MCP_INSTALL.md). REST agents: [AGENT_IN
 | --- | --- |
 | `record_approval` | Write a record of what was reported as approved. The approver name is supplied by the agent. An email contact gets a one-time confirm link. Returns `receipt_id`, public `receipt_url`, a one-time `edit_token`, and `confirm_url` when BotSupply is not sending email. |
 | `attach_proof` | Attach delivery proof with the `edit_token` (order confirmation, tracking, URL, hash, …). |
-| `get_receipt` | Public receipt JSON, including `approver_confirmation` (`unconfirmed`, `confirmed`, or `declined`). |
+| `record_payment` | Record a payment the agent already made (`edit_token`). Appends `payment_recorded`. Flags `paid_before_confirmation` and `over_cap` instead of rejecting them. |
+| `get_receipt` | Public receipt JSON, including `approver_confirmation` and `pay_allowed`. Pay only when `pay_allowed` is true. |
 | `verify_receipt` | Recompute the hash chain and HMAC; returns `valid` true/false plus `approver_confirmation`. `valid` means the record hasn't changed. It doesn't confirm who approved. |
 
 Public HTML page: `GET /r/:id` (Verified or Tampered badge, and a separate Approver unconfirmed / Approver confirmed ✓ / Approver declined line). Verified means the record hasn't changed since it was created. It doesn't confirm who approved. Approver confirmed means the person who opened the one-time link for that contact clicked Confirm.
@@ -89,6 +90,22 @@ The approver opens the link and sees the scope, price cap, merchant, and request
 
 Confirmed does not mean BotSupply checked a legal identity, and it does not mean the agent-reported name was proven. Unconfirmed is never labeled as a human verification. The Verified badge still only means the hash chain and HMAC match.
 
+### Confirm before pay
+
+BotSupply still does not hold or move the money. `pay_allowed` is the contract the paying agent follows. It is true only when `approver_confirmation.status` is `confirmed`, or when no `approver_contact` was given and the price cap is strictly under `RECEIPT_CONFIRM_THRESHOLD` (default **100**, in the price cap's currency units). At or above that threshold, `record_approval` without an email contact still succeeds, the receipt shows "No approver contact; confirmation required above threshold", and `pay_allowed` stays false.
+
+Poll `get_receipt` and pay only when `pay_allowed` is true. `POST /v1/receipts/:id/payment` (`record_payment`) then records what was paid. It requires `edit_token`, `external_payment_ref`, and `amount`. `paid_at` is optional and defaults to now. The call appends a signed `payment_recorded` hash-chain event. It sets `paid_before_confirmation` when the payment time is before the confirm event, or when a contact was set and the receipt was never confirmed. It sets `over_cap` when `amount` exceeds the price cap. Those payments are stored and flagged. They are not rejected.
+
+The public page lists Approved by agent report, Approver confirmed, and Paid, with times, then a green "Confirmed before payment" line or a red "Paid before confirmation" / "Over approved cap" line.
+
+```bash
+curl -s -X POST "https://botsupply.onrender.com/v1/receipts/$RECEIPT_ID/payment" \
+  -H 'content-type: application/json' \
+  -d '{"edit_token":"…","external_payment_ref":"pi_123","amount":"25.00"}'
+```
+
+Public receipt JSON and `/r/:id` mask email addresses and phone numbers that appear in the approver name, scope, merchant name, or proof value (for example `i***@gmail.com`). Stored rows and hash-chain payloads are unchanged, so existing signatures still verify. The confirm page still shows the approver the text they are confirming.
+
 Optional `confirmation_webhook_url` (public https only) receives `{ "receipt_id", "approver_confirmation" }` after the click. Delivery is best-effort. Poll `get_receipt` or `GET /v1/receipts/:id` if the webhook does not arrive.
 
 Email sending is behind `ApprovalNotifier`. **No email provider is included, and this service does not send mail unless one is configured.** Leave `RECEIPT_EMAIL_PROVIDER` unset (or `none`). The confirm link is returned as `confirm_url` with `confirm_delivery: "caller"`. A future provider would read:
@@ -109,7 +126,7 @@ Confirm attempts are rate-limited (30/min/IP), separate from the approval limit.
 
 Approvals are rate-limited (30/min/IP). The contact address is stored only as a SHA-256 hash and is never returned; a masked form (`a***@example.com`) appears only after Confirm or Decline. Each change is hash-chained (SHA-256). The latest hash is signed with HMAC-SHA256 using `RECEIPT_SIGNING_KEY`. Set that to a long random secret in production; if unset, an ephemeral key is generated and signatures will not verify after a restart. Changing the key makes older receipts verify as tampered.
 
-Startup adds nullable columns on `receipts` (`approver_decision`, `approver_decision_at`, `approver_decision_channel`, `approver_contact_masked`) and a `receipt_confirm_tokens` table. No backfill. Older rows keep their signatures and show Approver unconfirmed. The confirmation object is omitted from the hash snapshot until a decision exists, so existing chains stay valid.
+Startup adds nullable columns on `receipts` (`approver_decision`, `approver_decision_at`, `approver_decision_channel`, `approver_contact_masked`) and a `receipt_confirm_tokens` table. It also creates `receipt_payments` (nullable flags, no backfill, no change to existing receipt columns). Older rows keep their signatures and show Approver unconfirmed. The confirmation object is omitted from the hash snapshot until a decision exists, and `payments` is omitted until a payment is recorded, so existing chains stay valid.
 
 ## Wallets and credits
 
@@ -171,7 +188,8 @@ The hosted service uses Postgres and reports `"storage":"postgres","mode":"test"
 | --- | --- | --- |
 | `POST` | `/v1/receipts` | Record what was reported as approved (no auth). Email contact also issues a confirm link. |
 | `POST` | `/v1/receipts/:id/proof` | Attach proof (`edit_token`) |
-| `GET` | `/v1/receipts/:id` | Public JSON, including `approver_confirmation` |
+| `POST` | `/v1/receipts/:id/payment` | Record a payment the agent already made (`edit_token`). Flags early and over-cap payments. |
+| `GET` | `/v1/receipts/:id` | Public JSON, including `approver_confirmation` and `pay_allowed` |
 | `GET` | `/v1/receipts/:id/verify` | Integrity check and confirmation state |
 | `GET` | `/r/:id` | Public HTML receipt |
 | `GET` | `/c/:token` | Confirm page. Does not decide. |
@@ -200,6 +218,7 @@ Full curl examples for wallets, Checkout, Stripe webhook setup on Render, and es
 | `PUBLIC_BASE_URL` | `https://botsupply.onrender.com` |
 | `RECEIPT_SIGNING_KEY` | Long random secret for receipt HMAC |
 | `RECEIPT_CONFIRM_TTL_SECONDS` | Confirm link lifetime. Default 86400 (24 hours). |
+| `RECEIPT_CONFIRM_THRESHOLD` | Price-cap units at or above which a receipt with no email approver contact has `pay_allowed` false. Default 100. |
 | `RECEIPT_EMAIL_PROVIDER` | Leave unset. No email provider ships in this build. |
 
 Webhook endpoint: `https://botsupply.onrender.com/v1/stripe/webhook`.

@@ -13,9 +13,11 @@ import {
   newConfirmToken,
   planApproval,
   planApproverDecision,
+  planPayment,
   planProof,
   type ReceiptEventRow,
   type ReceiptHeaderRow,
+  type ReceiptPaymentRow,
   type ReceiptProofRow,
 } from "./receipts.js";
 import type { StripeMode } from "./stripe.js";
@@ -37,6 +39,7 @@ import {
   type CreateReceiptResult,
   type DecideConfirmationResult,
   type ReadConfirmationResult,
+  type RecordPaymentResult,
   type JobBalances,
   type JobRow,
   type PurchaseResult,
@@ -165,6 +168,21 @@ const SCHEMA = `
     created_at TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_receipt_confirm_tokens_receipt ON receipt_confirm_tokens (mode, receipt_id);
+  CREATE TABLE IF NOT EXISTS receipt_payments (
+    id TEXT PRIMARY KEY,
+    receipt_id TEXT NOT NULL REFERENCES receipts(id),
+    mode TEXT NOT NULL,
+    payment_index INTEGER NOT NULL,
+    external_payment_ref TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    paid_at TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    paid_before_confirmation INTEGER NOT NULL,
+    over_cap INTEGER NOT NULL,
+    UNIQUE (receipt_id, payment_index)
+  );
+  CREATE INDEX IF NOT EXISTS idx_receipt_payments_receipt ON receipt_payments (mode, receipt_id, payment_index);
 `;
 
 const JOB_SELECT = `id, payer_wallet_id, payee_wallet_id, amount_credits, description, status,
@@ -469,6 +487,61 @@ export function openSqliteStore(
     async getReceipt(id) {
       return loadReceipt(id);
     },
+    async recordReceiptPayment(input) {
+      const run = db.transaction((): RecordPaymentResult => {
+        const current = loadReceipt(input.receiptId);
+        if (!current) return { ok: false, code: "not_found" };
+        const now = new Date().toISOString();
+        const planned = planPayment(
+          current,
+          {
+            editToken: input.editToken,
+            externalPaymentRef: input.externalPaymentRef,
+            amount: input.amount,
+            paidAt: input.paidAt ?? now,
+          },
+          now,
+          receiptKey,
+        );
+        if (!planned.ok) return planned;
+        db.prepare(
+          `INSERT INTO receipt_payments (
+             id, receipt_id, mode, payment_index, external_payment_ref, amount, currency,
+             paid_at, recorded_at, paid_before_confirmation, over_cap
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          planned.payment.id,
+          input.receiptId,
+          mode,
+          planned.payment.payment_index,
+          planned.payment.external_payment_ref,
+          planned.payment.amount,
+          planned.payment.currency,
+          planned.payment.paid_at,
+          planned.payment.recorded_at,
+          planned.payment.paid_before_confirmation ? 1 : 0,
+          planned.payment.over_cap ? 1 : 0,
+        );
+        insertReceiptEvent(input.receiptId, planned.event);
+        const updated = db
+          .prepare(
+            `UPDATE receipts
+             SET content_hash = ?, signature = ?, updated_at = ?
+             WHERE id = ? AND mode = ?`,
+          )
+          .run(planned.contentHash, planned.signature, planned.updatedAt, input.receiptId, mode);
+        if (updated.changes !== 1) throw new Error(`Receipt payment update missed ${input.receiptId}`);
+        const saved = loadReceipt(input.receiptId);
+        if (!saved) throw new Error(`Receipt disappeared: ${input.receiptId}`);
+        return {
+          ok: true,
+          receipt: saved,
+          paid_before_confirmation: planned.paidBeforeConfirmation,
+          over_cap: planned.overCap,
+        };
+      });
+      return run.immediate();
+    },
     async attachReceiptProof(input) {
       const run = db.transaction((): AttachReceiptResult => {
         const current = loadReceipt(input.receiptId);
@@ -644,7 +717,19 @@ export function openSqliteStore(
          FROM receipt_events WHERE receipt_id = ? AND mode = ? ORDER BY seq ASC`,
       )
       .all(id, mode) as ReceiptEventRow[];
-    return assembleReceipt(header, proofs, events);
+    const payments = db
+      .prepare(
+        `SELECT id, payment_index, external_payment_ref, amount, currency, paid_at, recorded_at,
+                paid_before_confirmation, over_cap
+         FROM receipt_payments WHERE receipt_id = ? AND mode = ? ORDER BY payment_index ASC`,
+      )
+      .all(id, mode) as ReceiptPaymentRow[];
+    const emailApprover = Boolean(
+      db
+        .prepare(`SELECT 1 AS present FROM receipt_confirm_tokens WHERE receipt_id = ? AND mode = ? LIMIT 1`)
+        .get(id, mode),
+    );
+    return assembleReceipt(header, proofs, events, payments, emailApprover);
   }
 
   function insertReceipt(record: CreateReceiptResult["receipt"]): void {

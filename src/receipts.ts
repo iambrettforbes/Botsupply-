@@ -28,7 +28,18 @@ const CONFIRM_TTL_MS_MAX = 30 * 24 * 60 * 60 * 1000;
 
 export type ReceiptStatus = "approved" | "delivered" | "disputed";
 
-export type ReceiptEventKind = "approved" | "proof_attached" | "approver_confirmed" | "approver_declined";
+export type ReceiptEventKind =
+  | "approved"
+  | "proof_attached"
+  | "approver_confirmed"
+  | "approver_declined"
+  | "payment_recorded";
+
+/** Shown when the price cap is at or above the confirm threshold and no email approver contact was given. */
+export const CONFIRM_THRESHOLD_NOTICE = "No approver contact; confirmation required above threshold";
+
+/** Default `RECEIPT_CONFIRM_THRESHOLD`, in the receipt's price-cap currency units. */
+export const RECEIPT_CONFIRM_THRESHOLD_DEFAULT = "100";
 
 /** `sms` is reserved so a later sender can use the same confirm link. Only `email` is accepted today. */
 export type ContactChannel = "email" | "sms";
@@ -49,6 +60,19 @@ export type ReceiptProof = {
   actual_amount: string | null;
   over_cap: boolean;
   attached_at: string;
+};
+
+/** A payment the calling agent reported. BotSupply does not move the money. */
+export type ReceiptPayment = {
+  id: string;
+  payment_index: number;
+  external_payment_ref: string;
+  amount: string;
+  currency: string;
+  paid_at: string;
+  recorded_at: string;
+  paid_before_confirmation: boolean;
+  over_cap: boolean;
 };
 
 export type ReceiptEvent = {
@@ -87,7 +111,13 @@ export type ReceiptRecord = {
   approver_decision_at: string | null;
   approver_decision_channel: ContactChannel | null;
   approver_contact_masked: string | null;
+  /**
+   * True when an email confirm link was issued.
+   * Derived at read time from the confirm-token row. Not part of the hash snapshot.
+   */
+  email_approver: boolean;
   proofs: ReceiptProof[];
+  payments: ReceiptPayment[];
   events: ReceiptEvent[];
 };
 
@@ -97,6 +127,16 @@ export type PublicProof = {
   actual_amount: string | null;
   over_cap: boolean;
   attached_at: string;
+};
+
+export type PublicPayment = {
+  external_payment_ref: string;
+  amount: string;
+  currency: string;
+  paid_at: string;
+  recorded_at: string;
+  paid_before_confirmation: boolean;
+  over_cap: boolean;
 };
 
 export type PublicTimelineEntry = {
@@ -139,6 +179,15 @@ export type PublicReceipt = {
   content_hash: string;
   timeline: PublicTimelineEntry[];
   approver_confirmation: PublicApproverConfirmation;
+  /**
+   * True only when the approver confirmed, or when no approver contact was given
+   * and the price cap is strictly under the confirm threshold.
+   * Agents pay only when this is true. BotSupply does not move the money.
+   */
+  pay_allowed: boolean;
+  /** Set when the cap is at or above the threshold and no email approver contact was given. */
+  confirm_notice: string | null;
+  payments: PublicPayment[];
 };
 
 export type CreateReceiptInput = {
@@ -168,6 +217,15 @@ export type AttachProofInput = {
   status?: "delivered" | "disputed";
 };
 
+export type RecordPaymentInput = {
+  receiptId: string;
+  editToken: string;
+  externalPaymentRef: string;
+  amount: string;
+  /** ISO time. Null means the server clock at record time. */
+  paidAt: string | null;
+};
+
 export type VerifyChecks = {
   chain: boolean;
   content: boolean;
@@ -190,6 +248,18 @@ type SnapshotProof = {
   actual_amount: string | null;
   over_cap: boolean;
   attached_at: string;
+};
+
+type SnapshotPayment = {
+  payment_id: string;
+  payment_index: number;
+  external_payment_ref: string;
+  amount: string;
+  currency: string;
+  paid_at: string;
+  recorded_at: string;
+  paid_before_confirmation: boolean;
+  over_cap: boolean;
 };
 
 /** Canonical receipt body. Excludes the content hash, the signature, and the edit token plaintext. */
@@ -222,6 +292,11 @@ export type ReceiptSnapshot = {
     channel: ContactChannel;
     contact_masked: string;
   };
+  /**
+   * Present only after a payment is recorded.
+   * Left off while empty so receipts signed before payments existed still match.
+   */
+  payments?: SnapshotPayment[];
 };
 
 type ChainEventBody = {
@@ -249,6 +324,19 @@ export type PlanProofResult =
       overCap: boolean;
     }
   | { ok: false; code: "invalid_edit_token" | "invalid_status" | "tampered" };
+
+export type PlanPaymentResult =
+  | {
+      ok: true;
+      payment: ReceiptPayment;
+      event: ReceiptEvent;
+      contentHash: string;
+      signature: string;
+      updatedAt: string;
+      paidBeforeConfirmation: boolean;
+      overCap: boolean;
+    }
+  | { ok: false; code: "invalid_edit_token" | "tampered" };
 
 const AMOUNT_RE = /^(?:0|[1-9]\d{0,11})(?:\.\d{1,8})?$/;
 const CURRENCY_RE = /^[A-Za-z]{3,10}$/;
@@ -303,6 +391,35 @@ export function maskEmail(email: string): string {
   return domain ? `${first}***@${domain}` : `${first}***`;
 }
 
+const INLINE_EMAIL_RE =
+  /[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/g;
+
+/** Formatted numbers, leading +, or a bare 10 to 15 digit run. Amounts with a decimal point are left alone. */
+const INLINE_PHONE_RE =
+  /(?:\+\d{1,3}[\s.-]?)?(?:\(\d{3}\)[\s.-]?|\d{3}[\s.-])\d{3}[\s.-]\d{4}\b|\+\d{1,3}(?:[\s().-]*\d{2,4}){2,5}|\+\d{8,15}|\b\d{10,15}\b/g;
+
+function maskPhone(phone: string): string {
+  const digits = phone.replace(/\D/g, "");
+  if (digits.length < 2) return "***";
+  const tail = digits.slice(-2);
+  let index = 0;
+  const cutoff = digits.length - tail.length;
+  return phone.replace(/\d/g, () => {
+    const out = index < cutoff ? "*" : (tail[index - cutoff] ?? "*");
+    index += 1;
+    return out;
+  });
+}
+
+/**
+ * Mask email addresses and phone numbers inside free text.
+ * Display only. Callers keep the stored string for the hash chain.
+ */
+export function maskSensitiveText(value: string): string {
+  const withoutEmail = value.replace(INLINE_EMAIL_RE, (match) => maskEmail(match.toLowerCase()));
+  return withoutEmail.replace(INLINE_PHONE_RE, (match) => maskPhone(match));
+}
+
 const EMAIL_RE = /^[a-z0-9._%+-]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 
 export function normalizeEmail(raw: string): string | undefined {
@@ -310,6 +427,50 @@ export function normalizeEmail(raw: string): string | undefined {
   if (text.length === 0 || text.length > RECEIPT_CONTACT_MAX) return undefined;
   if (!EMAIL_RE.test(text)) return undefined;
   return text;
+}
+
+export function readConfirmThreshold(raw: string | undefined, override?: string): string {
+  if (override !== undefined) return validateConfirmThreshold(override);
+  const text = raw?.trim() ?? "";
+  if (text.length === 0) return RECEIPT_CONFIRM_THRESHOLD_DEFAULT;
+  return validateConfirmThreshold(text);
+}
+
+function validateConfirmThreshold(raw: string): string {
+  const amount = canonicalizeAmount(raw.trim(), true);
+  if (!amount) {
+    throw new Error(
+      "RECEIPT_CONFIRM_THRESHOLD must be a decimal from 0 with up to 12 digits and 8 decimal places",
+    );
+  }
+  return amount;
+}
+
+/**
+ * True when the approver confirmed, or when nobody left a contact and the cap is under the threshold.
+ * At or above the threshold, a missing email contact keeps this false.
+ */
+export function receiptPayAllowed(record: ReceiptRecord, threshold: string): boolean {
+  if (record.approver_decision === "confirmed") return true;
+  if (record.approver_contact_hash == null && decimalCompare(record.price_cap_amount, threshold) < 0) return true;
+  return false;
+}
+
+/** Notice for a cap at or above the threshold when no email confirm contact was issued. */
+export function receiptConfirmNotice(record: ReceiptRecord, threshold: string): string | null {
+  if (record.email_approver) return null;
+  if (decimalCompare(record.price_cap_amount, threshold) < 0) return null;
+  return CONFIRM_THRESHOLD_NOTICE;
+}
+
+/**
+ * True when paid_at is earlier than the confirm event, or a contact was set and the receipt was never confirmed.
+ * A receipt with no contact is not flagged for timing.
+ */
+export function paymentPrecedesConfirmation(record: ReceiptRecord, paidAt: string): boolean {
+  const confirmEvent = record.events.find((event) => event.kind === "approver_confirmed");
+  if (confirmEvent) return Date.parse(paidAt) < Date.parse(confirmEvent.created_at);
+  return record.approver_contact_hash != null;
 }
 
 export function readConfirmTtlMs(raw: string | undefined, override?: number): number {
@@ -579,6 +740,19 @@ export function receiptSnapshot(record: ReceiptRecord): ReceiptSnapshot {
       attached_at: proof.attached_at,
     })),
   };
+  if (record.payments.length > 0) {
+    snapshot.payments = record.payments.map((payment) => ({
+      payment_id: payment.id,
+      payment_index: payment.payment_index,
+      external_payment_ref: payment.external_payment_ref,
+      amount: payment.amount,
+      currency: payment.currency,
+      paid_at: payment.paid_at,
+      recorded_at: payment.recorded_at,
+      paid_before_confirmation: payment.paid_before_confirmation,
+      over_cap: payment.over_cap,
+    }));
+  }
   if (
     record.approver_decision &&
     record.approver_decision_at &&
@@ -636,7 +810,9 @@ export function planApproval(input: CreateReceiptInput, mode: StripeMode, now: s
     approver_decision_at: null,
     approver_decision_channel: null,
     approver_contact_masked: null,
+    email_approver: input.confirmContact != null,
     proofs: [],
+    payments: [],
     events: [],
   };
   const sealed = seal(
@@ -772,6 +948,63 @@ export function planApproverDecision(
   };
 }
 
+/**
+ * Append a payment_recorded event.
+ * Does not reject because the payment is early or over the cap. Those are flags on the event.
+ * Refuses a bad edit token or a tampered row so a broken receipt cannot be re-signed.
+ */
+export function planPayment(
+  record: ReceiptRecord,
+  input: Omit<RecordPaymentInput, "receiptId"> & { paidAt: string },
+  now: string,
+  key: Buffer,
+): PlanPaymentResult {
+  if (!editTokenMatches(record.edit_token_hash, input.editToken)) {
+    return { ok: false, code: "invalid_edit_token" };
+  }
+  if (!verifyReceiptRecord(record, key).valid) return { ok: false, code: "tampered" };
+  const previous = record.events[record.events.length - 1];
+  if (!previous) return { ok: false, code: "tampered" };
+  const overCap = exceedsCap(input.amount, record.price_cap_amount);
+  const paidBeforeConfirmation = paymentPrecedesConfirmation(record, input.paidAt);
+  const payment: ReceiptPayment = {
+    id: newHexId("pay", 12),
+    payment_index: record.payments.length,
+    external_payment_ref: input.externalPaymentRef,
+    amount: input.amount,
+    currency: record.price_cap_currency,
+    paid_at: input.paidAt,
+    recorded_at: now,
+    paid_before_confirmation: paidBeforeConfirmation,
+    over_cap: overCap,
+  };
+  const updated: ReceiptRecord = {
+    ...record,
+    updated_at: now,
+    payments: [...record.payments, payment],
+  };
+  const sealed = seal(
+    {
+      seq: record.events.length,
+      kind: "payment_recorded",
+      prev_hash: previous.hash,
+      snapshot: receiptSnapshot(updated),
+    },
+    key,
+    now,
+  );
+  return {
+    ok: true,
+    payment,
+    event: sealed.event,
+    contentHash: sealed.hash,
+    signature: sealed.signature,
+    updatedAt: now,
+    paidBeforeConfirmation,
+    overCap,
+  };
+}
+
 export function publicApproverConfirmation(record: ReceiptRecord): PublicApproverConfirmation {
   if (!record.approver_decision) {
     return { status: "unconfirmed", at: null, channel: null, contact_masked: null };
@@ -834,7 +1067,11 @@ function isChainBody(value: unknown, event: ReceiptEvent): value is ChainEventBo
   return body.seq === event.seq && body.kind === event.kind && body.prev_hash === event.prev_hash && body.snapshot != null;
 }
 
-export function toPublicReceipt(record: ReceiptRecord, receiptUrl: string): PublicReceipt {
+export function toPublicReceipt(
+  record: ReceiptRecord,
+  receiptUrl: string,
+  confirmThreshold = readConfirmThreshold(process.env.RECEIPT_CONFIRM_THRESHOLD),
+): PublicReceipt {
   return {
     receipt_id: record.id,
     receipt_url: receiptUrl,
@@ -842,17 +1079,17 @@ export function toPublicReceipt(record: ReceiptRecord, receiptUrl: string): Publ
     status: record.status,
     created_at: record.created_at,
     updated_at: record.updated_at,
-    approver: record.approver_name,
+    approver: maskSensitiveText(record.approver_name),
     agent_id: record.agent_id,
     agent_name: record.agent_name,
-    merchant: { name: record.merchant_name, url: record.merchant_url },
-    scope: record.scope,
+    merchant: { name: maskSensitiveText(record.merchant_name), url: record.merchant_url },
+    scope: maskSensitiveText(record.scope),
     price_cap: { amount: record.price_cap_amount, currency: record.price_cap_currency },
     payment_rail: record.payment_rail,
     external_payment_ref: record.external_payment_ref,
     proofs: record.proofs.map((proof) => ({
       type: proof.type,
-      value: proof.value,
+      value: maskSensitiveText(proof.value),
       actual_amount: proof.actual_amount,
       over_cap: proof.over_cap,
       attached_at: proof.attached_at,
@@ -866,6 +1103,17 @@ export function toPublicReceipt(record: ReceiptRecord, receiptUrl: string): Publ
       hash: event.hash,
     })),
     approver_confirmation: publicApproverConfirmation(record),
+    pay_allowed: receiptPayAllowed(record, confirmThreshold),
+    confirm_notice: receiptConfirmNotice(record, confirmThreshold),
+    payments: record.payments.map((payment) => ({
+      external_payment_ref: payment.external_payment_ref,
+      amount: payment.amount,
+      currency: payment.currency,
+      paid_at: payment.paid_at,
+      recorded_at: payment.recorded_at,
+      paid_before_confirmation: payment.paid_before_confirmation,
+      over_cap: payment.over_cap,
+    })),
   };
 }
 
@@ -1037,10 +1285,56 @@ export function asReceiptStatus(value: string): ReceiptStatus {
 }
 
 export function asEventKind(value: string): ReceiptEventKind {
-  if (value === "approved" || value === "proof_attached" || value === "approver_confirmed" || value === "approver_declined") {
+  if (
+    value === "approved" ||
+    value === "proof_attached" ||
+    value === "approver_confirmed" ||
+    value === "approver_declined" ||
+    value === "payment_recorded"
+  ) {
     return value;
   }
   throw new Error(`Unexpected receipt event kind: ${value}`);
+}
+
+/** Accept an ISO-8601 time and return canonical UTC. Undefined when it is not a time. */
+export function canonicalizePaidAt(raw: string): string | undefined {
+  const text = raw.trim();
+  if (text.length === 0 || text.length > 80) return undefined;
+  if (/[\u0000-\u001F\u007F]/.test(text)) return undefined;
+  const parsed = Date.parse(text);
+  if (!Number.isFinite(parsed)) return undefined;
+  return new Date(parsed).toISOString();
+}
+
+export function parsePaymentBody(body: Record<string, unknown>): Parsed<Omit<RecordPaymentInput, "receiptId">> {
+  const token = requiredText(body.edit_token, "edit_token", 200);
+  if (!token.ok) return token;
+  const externalRef = requiredText(body.external_payment_ref, "external_payment_ref", RECEIPT_REF_MAX);
+  if (!externalRef.ok) return externalRef;
+  const amount = amountFromUnknown(body.amount, false);
+  if (!amount) {
+    return {
+      ok: false,
+      message: "amount must be a positive decimal with up to 12 digits and 8 decimal places",
+    };
+  }
+  let paidAt: string | null = null;
+  if (body.paid_at != null) {
+    if (typeof body.paid_at !== "string") return { ok: false, message: "paid_at must be an ISO-8601 time" };
+    const canonical = canonicalizePaidAt(body.paid_at);
+    if (!canonical) return { ok: false, message: "paid_at must be an ISO-8601 time" };
+    paidAt = canonical;
+  }
+  return {
+    ok: true,
+    value: {
+      editToken: token.value,
+      externalPaymentRef: externalRef.value,
+      amount,
+      paidAt,
+    },
+  };
 }
 
 export function asApproverDecision(value: string): ApproverDecision {
@@ -1104,6 +1398,18 @@ export type ReceiptEventRow = {
   created_at: string | Date;
 };
 
+export type ReceiptPaymentRow = {
+  id: string;
+  payment_index: number | string;
+  external_payment_ref: string;
+  amount: string;
+  currency: string;
+  paid_at: string | Date;
+  recorded_at: string | Date;
+  paid_before_confirmation: number | string | boolean;
+  over_cap: number | string | boolean;
+};
+
 function iso(value: string | Date): string {
   return value instanceof Date ? value.toISOString() : value;
 }
@@ -1113,7 +1419,13 @@ function flag(value: number | string | boolean): boolean {
   return Number(value) === 1;
 }
 
-export function assembleReceipt(header: ReceiptHeaderRow, proofs: ReceiptProofRow[], events: ReceiptEventRow[]): ReceiptRecord {
+export function assembleReceipt(
+  header: ReceiptHeaderRow,
+  proofs: ReceiptProofRow[],
+  events: ReceiptEventRow[],
+  payments: ReceiptPaymentRow[] = [],
+  emailApprover = false,
+): ReceiptRecord {
   return {
     id: header.id,
     mode: asStripeMode(header.mode),
@@ -1138,6 +1450,7 @@ export function assembleReceipt(header: ReceiptHeaderRow, proofs: ReceiptProofRo
     approver_decision_at: header.approver_decision_at ? iso(header.approver_decision_at) : null,
     approver_decision_channel: header.approver_decision_channel ? asContactChannel(header.approver_decision_channel) : null,
     approver_contact_masked: header.approver_contact_masked ?? null,
+    email_approver: emailApprover,
     proofs: proofs.map((proof) => ({
       id: proof.id,
       proof_index: Number(proof.proof_index),
@@ -1146,6 +1459,17 @@ export function assembleReceipt(header: ReceiptHeaderRow, proofs: ReceiptProofRo
       actual_amount: proof.actual_amount,
       over_cap: flag(proof.over_cap),
       attached_at: iso(proof.attached_at),
+    })),
+    payments: payments.map((payment) => ({
+      id: payment.id,
+      payment_index: Number(payment.payment_index),
+      external_payment_ref: payment.external_payment_ref,
+      amount: payment.amount,
+      currency: payment.currency,
+      paid_at: iso(payment.paid_at),
+      recorded_at: iso(payment.recorded_at),
+      paid_before_confirmation: flag(payment.paid_before_confirmation),
+      over_cap: flag(payment.over_cap),
     })),
     events: events.map((event) => ({
       id: event.id,

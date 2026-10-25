@@ -79,6 +79,8 @@ function page(title: string, body: string): string {
     button.confirm { background: var(--stamp); color: var(--stamp-ink); }
     button.decline { background: transparent; color: var(--danger); border-color: var(--danger); }
     a { color: var(--stamp); }
+    footer.byline { margin-top: 28px; font-size: 11px; color: var(--muted); }
+    footer.byline a { color: var(--muted); text-decoration: none; }
     @media (max-width: 640px) {
       .row { grid-template-columns: 1fr; gap: 2px; }
     }
@@ -88,6 +90,7 @@ function page(title: string, body: string): string {
   <main>
     <p class="brand">BOTSUPPLY // confirm</p>
     ${body}
+    <footer class="byline"><a href="https://botsupply.onrender.com">Verified by BotSupply</a></footer>
   </main>
 </body>
 </html>`;
