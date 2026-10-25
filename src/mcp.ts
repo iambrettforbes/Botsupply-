@@ -26,7 +26,7 @@ const INSTRUCTIONS = [
   "Auth is a wallet API key: Authorization: Bearer on the MCP connection, or the api_key tool argument returned once by open_wallet.",
   "Credits are prepaid. create_checkout returns a Stripe Checkout URL when that route is configured. This server does not mint credits.",
   "create_job holds the caller's credits in escrow for another agent's wallet. release_job pays the payee when the work is delivered. refund_job returns the hold to the payer. The payer authorizes release and refund. The payee can also refund to cancel. A platform fee, ESCROW_FEE_BPS, defaults to 0 and is withheld from the payee only on release.",
-  "record_approval writes a public purchase receipt for a payment on any rail. BotSupply does not hold or move that money. attach_proof adds delivery proof with the edit_token from record_approval. get_receipt and verify_receipt are public.",
+  "record_approval writes a public record of what was reported as approved for a payment on any rail. The approver name is supplied by the calling agent and is not confirmation of who approved. BotSupply does not hold or move that money. attach_proof adds delivery proof with the edit_token from record_approval. get_receipt and verify_receipt are public. verify_receipt checks that the record has not changed since it was created. It does not confirm who approved.",
 ].join(" ");
 
 export type ApiResult = {
@@ -153,7 +153,7 @@ const recordApprovalSchema = fromJsonSchema<{
     approver: {
       type: "string",
       maxLength: RECEIPT_APPROVER_MAX,
-      description: "Display name or handle of the human who approved the purchase.",
+      description: "Name the calling agent reports as the approver. Not confirmation that this person approved.",
     },
     approver_contact: {
       type: "string",
@@ -182,11 +182,11 @@ const recordApprovalSchema = fromJsonSchema<{
     scope: {
       type: "string",
       maxLength: RECEIPT_SCOPE_MAX,
-      description: "What the human approved, in plain text.",
+      description: "What was reported as approved, in plain text.",
     },
     price_cap_amount: {
       anyOf: [{ type: "number", exclusiveMinimum: 0 }, { type: "string", minLength: 1, maxLength: 40 }],
-      description: "Maximum amount approved. A positive decimal, for example 25 or \"19.95\".",
+      description: "Maximum amount reported as approved. A positive decimal, for example 25 or \"19.95\".",
     },
     price_cap_currency: {
       type: "string",
@@ -506,9 +506,9 @@ function registerTools(server: McpServer, client: BotSupplyClient, defaultApiKey
   server.registerTool(
     "record_approval",
     {
-      title: "Record purchase approval",
+      title: "Record reported approval",
       description:
-        "Record a human's approval of a purchase on any payment rail. BotSupply does not hold or move the money. Returns receipt_id, a public receipt_url, and an edit_token shown once. No wallet or API key. Rate limited per IP. Same as POST /v1/receipts.",
+        "Write a record of what was reported as approved for a purchase on any payment rail. The approver is a name supplied by the calling agent; this does not confirm who approved. BotSupply does not hold or move the money. Returns receipt_id, a public receipt_url, and an edit_token shown once. No wallet or API key. Rate limited per IP. Same as POST /v1/receipts.",
       inputSchema: recordApprovalSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
@@ -556,7 +556,7 @@ function registerTools(server: McpServer, client: BotSupplyClient, defaultApiKey
     {
       title: "Get purchase receipt",
       description:
-        "Read a public purchase receipt: approval, scope, price cap, merchant, proofs, and content hash. No API key. The approver contact and the edit token are not included. Same as GET /v1/receipts/:id.",
+        "Read a public purchase receipt: what was reported as approved, scope, price cap, merchant, proofs, and content hash. The approver is a name the calling agent reported, not confirmation of who approved. No API key. The approver contact and the edit token are not included. Same as GET /v1/receipts/:id.",
       inputSchema: receiptIdSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
@@ -568,7 +568,7 @@ function registerTools(server: McpServer, client: BotSupplyClient, defaultApiKey
     {
       title: "Verify purchase receipt",
       description:
-        "Recompute the receipt hash chain and HMAC signature. valid is true when the stored receipt matches the chain and the server signature. valid is false when a row was altered. Same as GET /v1/receipts/:id/verify.",
+        "Recompute the receipt hash chain and HMAC signature. valid is true when the stored receipt matches the chain and the server signature, so the record hasn't been changed since it was created. valid does not confirm who approved. valid is false when a row was altered. Same as GET /v1/receipts/:id/verify.",
       inputSchema: receiptIdSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },

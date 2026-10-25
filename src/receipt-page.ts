@@ -43,7 +43,7 @@ function proofBlock(receipt: PublicReceipt): string {
 function timelineBlock(receipt: PublicReceipt): string {
   return receipt.timeline
     .map((entry) => {
-      const label = entry.kind === "approved" ? "Approved" : "Proof attached";
+      const label = entry.kind === "approved" ? "Reported as approved" : "Proof attached";
       return `<li>
         <div class="row"><dt>${esc(label)}</dt><dd>${esc(entry.at)}</dd></div>
         <p class="hash">prev ${esc(entry.prev_hash || "—")}</p>
@@ -71,6 +71,9 @@ export function renderReceiptPage(receipt: PublicReceipt, verification: VerifyRe
   const note = valid
     ? "The hash chain and server signature match this receipt."
     : "The stored receipt does not match its hash chain or server signature.";
+  const verifiedMeaning = valid
+    ? `<p class="explain">Verified = this record hasn't been changed since it was created. It doesn't confirm who approved.</p>`
+    : "";
   const agent =
     receipt.agent_name || receipt.agent_id
       ? [receipt.agent_name, receipt.agent_id].filter((part) => part && part.length > 0).join(" · ")
@@ -110,14 +113,18 @@ export function renderReceiptPage(receipt: PublicReceipt, verification: VerifyRe
     header.top { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
     .brand { margin: 0; letter-spacing: 0.12em; font-size: 12px; color: var(--muted); }
     h1 { margin: 8px 0 0; font-size: 28px; font-weight: 500; letter-spacing: -0.03em; }
+    .verdict { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; max-width: min(100%, 420px); }
     .badge { margin: 0; padding: 6px 10px; font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase; }
     .badge.ok { background: var(--stamp); color: var(--stamp-ink); }
     .badge.bad { background: var(--danger); color: #1a0703; }
+    .reported { margin: 0; font-size: 13px; text-align: right; }
+    .explain { color: var(--muted); margin: 18px 0 0; max-width: 62ch; }
     .note { color: var(--muted); margin: 18px 0 0; }
+    .explain + .note { margin-top: 8px; }
     section { margin-top: 28px; padding-top: 16px; border-top: 1px solid var(--line); }
     h2 { margin: 0 0 12px; font-size: 12px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
     .lead { margin: 0 0 8px; font-size: 18px; }
-    .row { display: grid; grid-template-columns: 140px 1fr; gap: 8px 16px; margin: 0 0 8px; }
+    .row { display: grid; grid-template-columns: minmax(140px, 220px) 1fr; gap: 8px 16px; margin: 0 0 8px; }
     dt { color: var(--muted); }
     dd { margin: 0; overflow-wrap: anywhere; }
     .scope { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -136,6 +143,8 @@ export function renderReceiptPage(receipt: PublicReceipt, verification: VerifyRe
     @media (max-width: 640px) {
       .row { grid-template-columns: 1fr; gap: 2px; }
       header.top { flex-direction: column; }
+      .verdict { align-items: flex-start; }
+      .reported { text-align: left; }
     }
   </style>
 </head>
@@ -146,12 +155,16 @@ export function renderReceiptPage(receipt: PublicReceipt, verification: VerifyRe
         <p class="brand">BOTSUPPLY // receipt</p>
         <h1>Purchase receipt</h1>
       </div>
-      ${badge}
+      <div class="verdict">
+        ${badge}
+        <p class="reported">Approver (reported by agent): ${esc(receipt.approver)}</p>
+      </div>
     </header>
+    ${verifiedMeaning}
     <p class="note">${esc(note)} BotSupply did not hold or move the money. Rail: ${esc(receipt.payment_rail)}.</p>
     <section>
-      <h2>Approval</h2>
-      ${row("Approver", receipt.approver)}
+      <h2>Reported approval</h2>
+      ${row("Approver (reported by agent)", receipt.approver)}
       ${row("Status", receipt.status)}
       ${row("When", receipt.created_at)}
       ${row("Agent", agent)}
@@ -185,7 +198,7 @@ export function renderReceiptPage(receipt: PublicReceipt, verification: VerifyRe
       <h2>Content hash</h2>
       <p class="content-hash">${esc(receipt.content_hash)}</p>
     </section>
-    <footer>Verify JSON at /v1/receipts/${esc(receipt.receipt_id)}/verify</footer>
+    <footer>Integrity check at /v1/receipts/${esc(receipt.receipt_id)}/verify. This does not confirm who approved.</footer>
   </main>
 </body>
 </html>`;

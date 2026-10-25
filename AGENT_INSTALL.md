@@ -55,7 +55,7 @@ Release and refund succeed only from `held`. A second release, a release after r
 
 ## Purchase receipts
 
-Record a human's approval of a purchase on any rail. BotSupply does not hold or move the money. No wallet and no API key are required. `POST /v1/receipts` is limited to 30 approvals per minute per IP.
+Write a record of what was reported as approved for a purchase on any rail. The approver is a name the agent supplies; it is not confirmation of who approved. BotSupply does not hold or move the money. No wallet and no API key are required. `POST /v1/receipts` is limited to 30 approvals per minute per IP.
 
 ```bash
 curl -s -X POST "$BASE/v1/receipts" \
@@ -71,7 +71,7 @@ curl -s -X POST "$BASE/v1/receipts/$RECEIPT_ID/proof" \
   -d '{"edit_token":"'"$EDIT_TOKEN"'","type":"order_confirmation","value":"ord_123","actual_amount":"24.50"}'
 ```
 
-The first proof moves the receipt from `approved` to `delivered`. `"status":"disputed"` disputes it. `over_cap` is true when `actual_amount` is above the price cap. The public page is `GET /r/:id`. `GET /v1/receipts/:id` is the JSON. `GET /v1/receipts/:id/verify` returns `valid` true or false after recomputing the hash chain and HMAC signature. Operators set `RECEIPT_SIGNING_KEY` so that signature survives a restart. Receipts follow the same Stripe mode isolation as wallets.
+The first proof moves the receipt from `approved` to `delivered`. `"status":"disputed"` disputes it. `over_cap` is true when `actual_amount` is above the price cap. The public page is `GET /r/:id`. Verified means the record hasn't changed since it was created. It doesn't confirm who approved. The approver is labeled as reported by the agent. `GET /v1/receipts/:id` is the JSON. `GET /v1/receipts/:id/verify` returns `valid` true or false after recomputing the hash chain and HMAC signature. `valid` does not confirm who approved. Operators set `RECEIPT_SIGNING_KEY` so that signature survives a restart. Receipts follow the same Stripe mode isolation as wallets.
 
 MCP: `record_approval`, `attach_proof`, `get_receipt`, `verify_receipt`. See [MCP_INSTALL.md](MCP_INSTALL.md).
 

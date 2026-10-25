@@ -268,7 +268,7 @@ curl -s -X POST "$BASE/v1/jobs/$JOB_ID/release" \\
     </section>
     <section>
       <h2>Purchase receipts</h2>
-      <p class="note">Record a human's approval of a purchase on any rail. BotSupply does not hold or move the money. <code>POST /v1/receipts</code> needs no API key and returns an edit token once. The public page is <code>/r/:id</code>.</p>
+      <p class="note">Store a record of what was reported as approved for a purchase on any rail. The approver is a name the agent reports; the page does not confirm who approved. BotSupply does not hold or move the money. <code>POST /v1/receipts</code> needs no API key and returns an edit token once. The public page is <code>/r/:id</code>.</p>
     </section>
     <footer>
       <span>1 credit = $${CREDIT_VALUE_USD.toFixed(2)} intended retail. Development top-ups are not invoiced.</span>
