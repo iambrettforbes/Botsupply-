@@ -54,7 +54,7 @@ type Rpc = {
 
 function approval(overrides: Record<string, unknown> = {}) {
   return {
-    approver: "Brett Forbes",
+    approver: "Jane Doe",
     approver_contact: CONTACT,
     agent_id: "agent_demo",
     agent_name: "Desk Agent",
@@ -106,7 +106,7 @@ function toolJson(message: Rpc): { isError: boolean; body: unknown } {
 }
 
 test("private-detail helpers drop contacts and keep a short on-file tail", () => {
-  assert.equal(approverInitials("Brett Forbes"), "B.F.");
+  assert.equal(approverInitials("Jane Doe"), "J.D.");
   assert.equal(approverInitials(`Ada ${RAW_EMAIL}`), "A.");
   assert.equal(stripPrivateDetails(`Ship to ${RAW_EMAIL}. Call ${RAW_PHONE}. Card ending 4242.`), "Ship to. Call.");
   assert.equal(onFileTail("order ending 4242 ref ABCD9999"), "on file 9999");
@@ -179,7 +179,7 @@ test("reads derive the latest payment ref and flags without rewriting the stored
     public_view: string;
   };
   assert.equal(row.external_payment_ref, null);
-  assert.equal(row.approver_name, "Brett Forbes");
+  assert.equal(row.approver_name, "Jane Doe");
   assert.equal(row.public_view, "full");
   const payloads = db.prepare("SELECT kind, payload_json FROM receipt_events ORDER BY seq").all() as Array<{
     kind: string;
@@ -238,7 +238,7 @@ test("redacted public view hides purchaser details without changing the signatur
     token = receipt.edit_token ?? "";
     hash = receipt.content_hash;
     assert.equal(receipt.public_view, "redacted");
-    assert.equal(receipt.approver, "B.F.");
+    assert.equal(receipt.approver, "J.D.");
     assert.equal(receipt.agent_name, "Agent");
     assert.equal(receipt.agent_id, null);
     assert.equal(receipt.scope, "Weekly coffee. Reach if needed.");
@@ -287,7 +287,7 @@ test("redacted public view hides purchaser details without changing the signatur
 
     const page = await app.inject({ method: "GET", url: `/r/${id}` });
     assert.match(page.body, /Some details hidden by the purchaser/);
-    assert.match(page.body, /Approver \(reported by agent\): B\.F\./);
+    assert.match(page.body, /Approver \(reported by agent\): J\.D\./);
     assert.match(page.body, /<dt>Agent<\/dt><dd>Agent<\/dd>/);
     assert.match(page.body, /<dt>Payment ref<\/dt><dd>on file 9876<\/dd>/);
     assert.match(page.body, /Paid before confirmation/);
@@ -299,7 +299,7 @@ test("redacted public view hides purchaser details without changing the signatur
     assert.equal(page.body.includes(RAW_EMAIL), false);
     assert.equal(page.body.includes(RAW_PHONE), false);
     assert.equal(page.body.includes("ending 4242"), false);
-    assert.equal(page.body.includes("Brett"), false);
+    assert.equal(page.body.includes("Jane"), false);
     assert.equal(page.body.includes("Desk Agent"), false);
     assert.equal(page.body.includes("agent_demo"), false);
     assert.equal(page.body.includes("pi_3Nabc9876"), false);
@@ -336,7 +336,7 @@ test("redacted public view hides purchaser details without changing the signatur
     assert.equal(full.public_view, "full");
     assert.equal(full.content_hash, (paid.json() as ReceiptBody).content_hash);
     assert.equal(full.updated_at, (paid.json() as ReceiptBody).updated_at);
-    assert.equal(full.approver, `Brett Forbes`);
+    assert.equal(full.approver, `Jane Doe`);
     assert.equal(full.agent_name, "Desk Agent");
     assert.equal(full.agent_id, "agent_demo");
     assert.match(full.scope, /i\*\*\*@gmail\.com/);
@@ -346,7 +346,7 @@ test("redacted public view hides purchaser details without changing the signatur
     assert.match(full.proofs[0]?.value ?? "", /i\*\*\*@gmail\.com/);
     const fullPage = await app.inject({ method: "GET", url: `/r/${id}` });
     assert.doesNotMatch(fullPage.body, /Some details hidden by the purchaser/);
-    assert.match(fullPage.body, /Brett Forbes/);
+    assert.match(fullPage.body, /Jane Doe/);
 
     const hidden = await app.inject({
       method: "POST",
@@ -356,7 +356,7 @@ test("redacted public view hides purchaser details without changing the signatur
     assert.equal(hidden.statusCode, 200, hidden.body);
     const redacted = hidden.json() as ReceiptBody;
     assert.equal(redacted.scope, "Two bags, no contacts");
-    assert.equal(redacted.approver, "B.F.");
+    assert.equal(redacted.approver, "J.D.");
     assert.equal(redacted.content_hash, full.content_hash);
     assert.equal(redacted.updated_at, full.updated_at);
     assert.notEqual(redacted.content_hash, hash);
@@ -378,7 +378,7 @@ test("redacted public view hides purchaser details without changing the signatur
     external_payment_ref: string | null;
     content_hash: string;
   };
-  assert.equal(row.approver_name, "Brett Forbes");
+  assert.equal(row.approver_name, "Jane Doe");
   assert.equal(row.scope.includes(RAW_EMAIL), true);
   assert.equal(row.public_view, "redacted");
   assert.equal(row.public_scope, "Two bags, no contacts");
@@ -395,7 +395,7 @@ test("redacted public view hides purchaser details without changing the signatur
     const verified = await again.inject({ method: "GET", url: `/v1/receipts/${id}/verify` });
     assert.equal((verified.json() as VerifyBody).valid, true);
     const read = (await again.inject({ method: "GET", url: `/v1/receipts/${id}` })).json() as ReceiptBody;
-    assert.equal(read.approver, "B.F.");
+    assert.equal(read.approver, "J.D.");
     assert.equal(read.scope, "Two bags, no contacts");
     assert.equal(read.external_payment_ref, "on file 9876");
     assert.equal(read.content_hash, row.content_hash);
@@ -441,7 +441,7 @@ test("MCP set_receipt_visibility is a fifteenth tool and does not re-sign", asyn
     assert.equal(changed.isError, false);
     const body = changed.body as ReceiptBody;
     assert.equal(body.public_view, "redacted");
-    assert.equal(body.approver, "B.F.");
+    assert.equal(body.approver, "J.D.");
     assert.equal(body.agent_name, "Agent");
     assert.equal(body.scope, "A public brief");
     assert.equal(body.content_hash, receipt.content_hash);

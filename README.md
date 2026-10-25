@@ -141,7 +141,7 @@ MCP: `set_receipt_visibility`. Omit `public_scope` to leave the stored public sc
 
 While `redacted`, the public JSON and `/r/:id` show:
 
-- Approver as initials only (`Brett Forbes` becomes `B.F.`)
+- Approver as initials only (`Jane Doe` becomes `J.D.`)
 - Agent name as `Agent` (the agent id is omitted)
 - No email or phone, not even masked
 - Payment refs and proof values as `on file` plus the last 4 characters that remain after card phrases such as `ending 1234` are removed

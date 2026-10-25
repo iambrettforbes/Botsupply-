@@ -75,7 +75,7 @@ Pass `public_view: "redacted"` on `record_approval`, or change it later with `se
 
 In redacted mode the public JSON and `/r/:id` show:
 
-- Approver initials only, such as `B.F.`
+- Approver initials only, such as `Jane Doe` becoming `J.D.`
 - Agent name `Agent`
 - No email or phone, not even masked
 - Payment refs and proof values as `on file` plus the last 4 remaining characters

@@ -481,7 +481,7 @@ export function stripPrivateDetails(value: string): string {
     .trim();
 }
 
-/** Initials such as "Brett Forbes" → "B.F.". Emails and phone numbers are dropped first. */
+/** Initials such as "Jane Doe" → "J.D.". Emails and phone numbers are dropped first. */
 export function approverInitials(name: string): string {
   const stripped = stripPrivateDetails(name);
   const initials: string[] = [];
