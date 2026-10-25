@@ -50,7 +50,47 @@ function timelineLabel(kind: PublicReceipt["timeline"][number]["kind"]): string 
       return "Approver confirmed";
     case "approver_declined":
       return "Approver declined";
+    case "payment_recorded":
+      return "Payment recorded";
   }
+}
+
+function orderBlock(receipt: PublicReceipt): string {
+  const approvedAt = receipt.timeline.find((entry) => entry.kind === "approved")?.at ?? receipt.created_at;
+  const confirmation = receipt.approver_confirmation;
+  const confirmWhen =
+    confirmation.status === "confirmed"
+      ? (confirmation.at ?? "")
+      : confirmation.status === "declined"
+        ? `Declined ${confirmation.at ?? ""}`.trim()
+        : "Not yet";
+  const notice = receipt.confirm_notice ? `<p class="order-note">${esc(receipt.confirm_notice)}</p>` : "";
+  const paid =
+    receipt.payments.length === 0
+      ? `<p class="order-note">Not yet</p>`
+      : receipt.payments
+          .map(
+            (payment) =>
+              `<p class="order-note">${esc(payment.paid_at)} · ${esc(payment.amount)} ${esc(payment.currency)} · ${esc(payment.external_payment_ref)}</p>`,
+          )
+          .join("");
+  const paidEarly = receipt.payments.some((payment) => payment.paid_before_confirmation);
+  const overCap = receipt.payments.some((payment) => payment.over_cap);
+  const confirmedBefore = receipt.payments.length > 0 && confirmation.status === "confirmed" && !paidEarly && !overCap;
+  const earlyLine = paidEarly ? `<p class="pay-line bad">Paid before confirmation</p>` : "";
+  const capLine = overCap ? `<p class="pay-line bad">Over approved cap</p>` : "";
+  const okLine = confirmedBefore ? `<p class="pay-line ok">Confirmed before payment</p>` : "";
+  return `<section>
+      <h2>Order</h2>
+      <ol class="order">
+        <li><strong>Approved by agent report</strong><p class="order-note">${esc(approvedAt)}</p></li>
+        <li><strong>Approver confirmed</strong><p class="order-note">${esc(confirmWhen)}</p>${notice}</li>
+        <li><strong>Paid</strong>${paid}</li>
+      </ol>
+      ${earlyLine}
+      ${capLine}
+      ${okLine}
+    </section>`;
 }
 
 function confirmationBlock(receipt: PublicReceipt): string {
@@ -168,6 +208,16 @@ export function renderReceiptPage(receipt: PublicReceipt, verification: VerifyRe
     .confirm-state.is-confirmed strong { color: var(--stamp); }
     .confirm-state.is-declined { border-color: var(--danger); }
     .confirm-state.is-declined strong { color: var(--danger); }
+    .order { list-style: none; margin: 0; padding: 0; }
+    .order li { margin: 0 0 14px; }
+    .order strong { display: block; font-size: 15px; font-weight: 500; }
+    .order-note { margin: 4px 0 0; color: var(--muted); }
+    .pay-line { margin: 12px 0 0; padding: 8px 10px; font-size: 14px; }
+    .pay-line.ok { background: var(--stamp); color: var(--stamp-ink); }
+    .pay-line.bad { background: var(--danger); color: #1a0703; }
+    footer p { margin: 0; }
+    .byline { margin-top: 10px; font-size: 11px; }
+    .byline a { color: var(--muted); text-decoration: none; }
     section { margin-top: 28px; padding-top: 16px; border-top: 1px solid var(--line); }
     h2 { margin: 0 0 12px; font-size: 12px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
     .lead { margin: 0 0 8px; font-size: 18px; }
@@ -210,6 +260,7 @@ export function renderReceiptPage(receipt: PublicReceipt, verification: VerifyRe
     ${verifiedMeaning}
     <p class="note">${esc(note)} BotSupply did not hold or move the money. Rail: ${esc(receipt.payment_rail)}.</p>
     ${confirmationBlock(receipt)}
+    ${orderBlock(receipt)}
     <section>
       <h2>Reported approval</h2>
       ${row("Approver (reported by agent)", receipt.approver)}
@@ -246,7 +297,10 @@ export function renderReceiptPage(receipt: PublicReceipt, verification: VerifyRe
       <h2>Content hash</h2>
       <p class="content-hash">${esc(receipt.content_hash)}</p>
     </section>
-    <footer>Integrity check at /v1/receipts/${esc(receipt.receipt_id)}/verify. This does not confirm who approved.</footer>
+    <footer>
+      <p>Integrity check at /v1/receipts/${esc(receipt.receipt_id)}/verify. This does not confirm who approved.</p>
+      <p class="byline"><a href="https://botsupply.onrender.com">Verified by BotSupply</a></p>
+    </footer>
   </main>
 </body>
 </html>`;

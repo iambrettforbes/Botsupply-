@@ -18,6 +18,8 @@ services:
         value: production
       - key: PUBLIC_BASE_URL
         value: https://botsupply.onrender.com
+      - key: RECEIPT_CONFIRM_THRESHOLD
+        value: "100"
       # Fill these in the Dashboard. Do not commit secret values.
       # On an already-created service, add them under Environment; sync: false
       # is not re-prompted on later Blueprint updates.

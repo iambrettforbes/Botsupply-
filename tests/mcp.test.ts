@@ -65,6 +65,7 @@ test("MCP tools list the live catalog and do not invent a reservation tool", asy
       "open_wallet",
       "purchase",
       "record_approval",
+      "record_payment",
       "refund_job",
       "release_job",
       "verify_receipt",

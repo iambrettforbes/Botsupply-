@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import type { AttachProofInput, ContactChannel, CreateReceiptInput, ReceiptRecord } from "./receipts.js";
+import type { AttachProofInput, ContactChannel, CreateReceiptInput, ReceiptRecord, RecordPaymentInput } from "./receipts.js";
 import type { StripeMode } from "./stripe.js";
 
 export type StorageKind = "sqlite" | "postgres";
@@ -118,6 +118,10 @@ export type AttachReceiptResult =
   | { ok: true; receipt: ReceiptRecord; over_cap: boolean }
   | { ok: false; code: "not_found" | "invalid_edit_token" | "invalid_status" | "tampered" };
 
+export type RecordPaymentResult =
+  | { ok: true; receipt: ReceiptRecord; paid_before_confirmation: boolean; over_cap: boolean }
+  | { ok: false; code: "not_found" | "invalid_edit_token" | "tampered" };
+
 export type ConfirmationView = {
   state: "open" | "used" | "expired";
   receipt: ReceiptRecord;
@@ -176,6 +180,11 @@ export type Store = {
   getReceipt(id: string): Promise<ReceiptRecord | undefined>;
   /** Append proof and a chain event when the edit token matches and the stored row still verifies. */
   attachReceiptProof(input: AttachProofInput): Promise<AttachReceiptResult>;
+  /**
+   * Append a payment_recorded event when the edit token matches and the stored row still verifies.
+   * Early and over-cap payments are stored and flagged. They are not rejected.
+   */
+  recordReceiptPayment(input: RecordPaymentInput): Promise<RecordPaymentResult>;
   /** Read a confirm link without changing it. GET must not confirm. */
   readConfirmation(token: string): Promise<ReadConfirmationResult>;
   /** Record Confirm or Decline once. Expired and used tokens are refused. */

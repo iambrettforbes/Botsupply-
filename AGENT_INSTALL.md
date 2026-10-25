@@ -71,9 +71,17 @@ curl -s -X POST "$BASE/v1/receipts/$RECEIPT_ID/proof" \
   -d '{"edit_token":"'"$EDIT_TOKEN"'","type":"order_confirmation","value":"ord_123","actual_amount":"24.50"}'
 ```
 
-The first proof moves the receipt from `approved` to `delivered`. `"status":"disputed"` disputes it. `over_cap` is true when `actual_amount` is above the price cap. The public page is `GET /r/:id`. Verified means the record hasn't changed since it was created. It doesn't confirm who approved. The approver name is labeled as reported by the agent. A separate line is Approver unconfirmed, Approver confirmed ✓, or Approver declined. Confirmed means the person who opened the one-time link clicked Confirm. `GET /c/:token` shows the summary and does not decide; Confirm and Decline are POSTs and work once. `GET /v1/receipts/:id` is the JSON and includes `approver_confirmation`. `GET /v1/receipts/:id/verify` returns `valid` true or false after recomputing the hash chain and HMAC signature, plus the same confirmation state. `valid` does not confirm who approved. Optional `confirmation_webhook_url` is notified best-effort after the click; poll the receipt if it does not arrive. Operators set `RECEIPT_SIGNING_KEY` so that signature survives a restart. Leave `RECEIPT_EMAIL_PROVIDER` unset unless a sender is wired up. Receipts follow the same Stripe mode isolation as wallets.
+The first proof moves the receipt from `approved` to `delivered`. `"status":"disputed"` disputes it. `over_cap` is true when `actual_amount` is above the price cap. The public page is `GET /r/:id`. Verified means the record hasn't changed since it was created. It doesn't confirm who approved. The approver name is labeled as reported by the agent. A separate line is Approver unconfirmed, Approver confirmed ✓, or Approver declined. Confirmed means the person who opened the one-time link clicked Confirm. `GET /c/:token` shows the summary and does not decide; Confirm and Decline are POSTs and work once. `GET /v1/receipts/:id` is the JSON and includes `approver_confirmation` and `pay_allowed`. Pay only when `pay_allowed` is true. `GET /v1/receipts/:id/verify` returns `valid` true or false after recomputing the hash chain and HMAC signature, plus the same confirmation state. `valid` does not confirm who approved. Optional `confirmation_webhook_url` is notified best-effort after the click; poll the receipt if it does not arrive. Operators set `RECEIPT_SIGNING_KEY` so that signature survives a restart. Leave `RECEIPT_EMAIL_PROVIDER` unset unless a sender is wired up. `RECEIPT_CONFIRM_THRESHOLD` defaults to 100. Receipts follow the same Stripe mode isolation as wallets.
 
-MCP: `record_approval`, `attach_proof`, `get_receipt`, `verify_receipt`. See [MCP_INSTALL.md](MCP_INSTALL.md).
+After `pay_allowed` is true, record the payment the agent already made. BotSupply does not move it. An early or over-cap payment is stored and flagged.
+
+```bash
+curl -s -X POST "$BASE/v1/receipts/$RECEIPT_ID/payment" \
+  -H 'content-type: application/json' \
+  -d '{"edit_token":"'"$EDIT_TOKEN"'","external_payment_ref":"pi_123","amount":"25.00"}'
+```
+
+MCP: `record_approval`, `attach_proof`, `record_payment`, `get_receipt`, `verify_receipt`. See [MCP_INSTALL.md](MCP_INSTALL.md).
 
 ## Pay with Stripe
 

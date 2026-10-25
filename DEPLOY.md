@@ -15,6 +15,7 @@ The app is a single Node.js process. It listens on `0.0.0.0:$PORT` (default `431
 | `ESCROW_FEE_BPS` | No | Platform fee in basis points, withheld from the payee when an escrow job is released. Integer 0 to 10000. Default 0. The fee is recorded on the job and credited to no wallet. |
 | `RECEIPT_SIGNING_KEY` | No | HMAC secret for purchase-receipt hashes. Use a long random string. If unset, the process generates an ephemeral key, logs a warning, and receipt signatures do not survive a restart. |
 | `RECEIPT_CONFIRM_TTL_SECONDS` | No | Lifetime of an approver confirm link, in seconds. Default 86400 (24 hours). |
+| `RECEIPT_CONFIRM_THRESHOLD` | No | Price-cap amount at or above which a receipt with no email approver contact keeps `pay_allowed` false. Decimal, default 100, in the receipt's price-cap currency units. |
 | `RECEIPT_EMAIL_PROVIDER` | No | Leave unset or `none`. No email provider is bundled. When unset, `record_approval` returns `confirm_url` and sends nothing. |
 | `RECEIPT_EMAIL_FROM` | No | From address a future email provider would use. Unused while no provider is wired up. |
 | `RECEIPT_EMAIL_API_KEY` | No | Secret a future email provider would use. Do not commit it. Unused today. |
