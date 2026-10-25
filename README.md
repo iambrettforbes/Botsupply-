@@ -33,12 +33,12 @@ Install notes and auth: [MCP_INSTALL.md](MCP_INSTALL.md). REST agents: [AGENT_IN
 
 | Tool | What it does |
 | --- | --- |
-| `record_approval` | Write a record of what was reported as approved for a purchase on any rail. The approver is a name the agent supplies. Returns `receipt_id`, public `receipt_url`, and a one-time `edit_token`. |
+| `record_approval` | Write a record of what was reported as approved. The approver name is supplied by the agent. An email contact gets a one-time confirm link. Returns `receipt_id`, public `receipt_url`, a one-time `edit_token`, and `confirm_url` when BotSupply is not sending email. |
 | `attach_proof` | Attach delivery proof with the `edit_token` (order confirmation, tracking, URL, hash, …). |
-| `get_receipt` | Public receipt JSON. |
-| `verify_receipt` | Recompute the hash chain and HMAC; returns `valid` true/false. `valid` means the record hasn't changed. It doesn't confirm who approved. |
+| `get_receipt` | Public receipt JSON, including `approver_confirmation` (`unconfirmed`, `confirmed`, or `declined`). |
+| `verify_receipt` | Recompute the hash chain and HMAC; returns `valid` true/false plus `approver_confirmation`. `valid` means the record hasn't changed. It doesn't confirm who approved. |
 
-Public HTML page: `GET /r/:id` (Verified or Tampered badge). Verified means the record hasn't changed since it was created. It doesn't confirm who approved. The approver is shown as reported by the agent.
+Public HTML page: `GET /r/:id` (Verified or Tampered badge, and a separate Approver unconfirmed / Approver confirmed ✓ / Approver declined line). Verified means the record hasn't changed since it was created. It doesn't confirm who approved. Approver confirmed means the person who opened the one-time link for that contact clicked Confirm.
 
 ### Wallets and catalog
 
@@ -61,15 +61,15 @@ Public HTML page: `GET /r/:id` (Verified or Tampered badge). Verified means the 
 
 ## Purchase receipts
 
-An agent records what was reported as approved for a purchase on any payment rail (`stripe_link`, `card`, `x402`, `botsupply_wallet`, …) and later attaches proof of delivery. The approver is a name the agent typed in. BotSupply stores that record and a public URL. **It does not hold or move the money, and it does not confirm who approved.** No wallet and no API key are required.
+An agent records what was reported as approved for a purchase on any payment rail (`stripe_link`, `card`, `x402`, `botsupply_wallet`, …) and later attaches proof of delivery. The approver name is text the agent typed in. BotSupply stores that record and a public URL. **It does not hold or move the money.** No wallet and no API key are required.
 
 ```bash
 curl -s -X POST https://botsupply.onrender.com/v1/receipts \
   -H 'content-type: application/json' \
-  -d '{"approver":"Ada","merchant_name":"North Market","scope":"Two bags of coffee","price_cap_amount":"25.00","price_cap_currency":"USD","payment_rail":"stripe_link"}'
+  -d '{"approver":"Ada","approver_contact":"ada@example.com","merchant_name":"North Market","scope":"Two bags of coffee","price_cap_amount":"25.00","price_cap_currency":"USD","payment_rail":"stripe_link"}'
 ```
 
-Response includes `receipt_id` (`rcpt_` + 24 hex), `receipt_url`, and `edit_token` (returned once; keep it to attach proof).
+Response includes `receipt_id` (`rcpt_` + 24 hex), `receipt_url`, and `edit_token` (returned once; keep it to attach proof). When `approver_contact` is an email and no email provider is configured, the response also includes `confirm_url` (returned once; the caller delivers it). The address itself is not returned.
 
 ```bash
 curl -s -X POST https://botsupply.onrender.com/v1/receipts/$RECEIPT_ID/proof \
@@ -77,11 +77,39 @@ curl -s -X POST https://botsupply.onrender.com/v1/receipts/$RECEIPT_ID/proof \
   -d '{"edit_token":"…","type":"order_confirmation","value":"ord_123"}'
 ```
 
-- `GET /v1/receipts/:id` — public JSON  
-- `GET /v1/receipts/:id/verify` — hash chain + HMAC check  
-- `GET /r/:id` — HTML with Verified / Tampered badge. Verified means the record hasn't changed since it was created and doesn't confirm who approved. The approver is labeled as reported by the agent.
+### Approver confirmation
 
-Approvals are rate-limited (30/min/IP). Optional `approver_contact` is stored only as a SHA-256 hash and is never returned. Each change is hash-chained (SHA-256). The latest hash is signed with HMAC-SHA256 using `RECEIPT_SIGNING_KEY`. Set that to a long random secret in production; if unset, an ephemeral key is generated and signatures will not verify after a restart. Changing the key makes older receipts verify as tampered.
+Passing an email as `approver_contact` (a string, or `{ "channel": "email", "address": "ada@example.com" }`) issues one confirm link, `/c/:token`. The token is unguessable, stored only as a SHA-256 hash, expires (default 24 hours, `RECEIPT_CONFIRM_TTL_SECONDS`), and works once. `sms` is reserved in the channel field and is rejected until a sender exists. A non-email string is still stored only as a hash and does not issue a link, matching older callers.
+
+The approver opens the link and sees the scope, price cap, merchant, and requesting agent, with Confirm and Decline buttons. Opening the link does not decide anything: link scanners that only GET are ignored. The buttons POST. Confirm and decline are new hash-chain events (time, channel, masked contact). The public state is then:
+
+- **Approver unconfirmed** — default, including receipts created before this step
+- **Approver confirmed ✓** — the person with access to that contact clicked Confirm, with time and channel
+- **Approver declined** — that person clicked Decline
+
+Confirmed does not mean BotSupply checked a legal identity, and it does not mean the agent-reported name was proven. Unconfirmed is never labeled as a human verification. The Verified badge still only means the hash chain and HMAC match.
+
+Optional `confirmation_webhook_url` (public https only) receives `{ "receipt_id", "approver_confirmation" }` after the click. Delivery is best-effort. Poll `get_receipt` or `GET /v1/receipts/:id` if the webhook does not arrive.
+
+Email sending is behind `ApprovalNotifier`. **No email provider is included, and this service does not send mail unless one is configured.** Leave `RECEIPT_EMAIL_PROVIDER` unset (or `none`). The confirm link is returned as `confirm_url` with `confirm_delivery: "caller"`. A future provider would read:
+
+| Variable | Purpose |
+| --- | --- |
+| `RECEIPT_EMAIL_PROVIDER` | Provider id. Unset or `none` sends nothing. Other values are not wired up yet; the link is still returned to the caller. |
+| `RECEIPT_EMAIL_FROM` | From address that provider would use. Unused today. |
+| `RECEIPT_EMAIL_API_KEY` | Secret that provider would use. Do not commit it. Unused today. |
+
+Confirm attempts are rate-limited (30/min/IP), separate from the approval limit.
+
+- `GET /v1/receipts/:id` — public JSON, including `approver_confirmation`  
+- `GET /v1/receipts/:id/verify` — hash chain + HMAC check, plus `approver_confirmation`  
+- `GET /r/:id` — HTML with Verified / Tampered badge and the confirmation line  
+- `GET /c/:token` — confirm page (does not decide)  
+- `POST /c/:token/confirm` and `POST /c/:token/decline` — one-time decision  
+
+Approvals are rate-limited (30/min/IP). The contact address is stored only as a SHA-256 hash and is never returned; a masked form (`a***@example.com`) appears only after Confirm or Decline. Each change is hash-chained (SHA-256). The latest hash is signed with HMAC-SHA256 using `RECEIPT_SIGNING_KEY`. Set that to a long random secret in production; if unset, an ephemeral key is generated and signatures will not verify after a restart. Changing the key makes older receipts verify as tampered.
+
+Startup adds nullable columns on `receipts` (`approver_decision`, `approver_decision_at`, `approver_decision_channel`, `approver_contact_masked`) and a `receipt_confirm_tokens` table. No backfill. Older rows keep their signatures and show Approver unconfirmed. The confirmation object is omitted from the hash snapshot until a decision exists, so existing chains stay valid.
 
 ## Wallets and credits
 
@@ -141,11 +169,14 @@ The hosted service uses Postgres and reports `"storage":"postgres","mode":"test"
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| `POST` | `/v1/receipts` | Record what was reported as approved (no auth) |
+| `POST` | `/v1/receipts` | Record what was reported as approved (no auth). Email contact also issues a confirm link. |
 | `POST` | `/v1/receipts/:id/proof` | Attach proof (`edit_token`) |
-| `GET` | `/v1/receipts/:id` | Public JSON |
-| `GET` | `/v1/receipts/:id/verify` | Integrity check |
+| `GET` | `/v1/receipts/:id` | Public JSON, including `approver_confirmation` |
+| `GET` | `/v1/receipts/:id/verify` | Integrity check and confirmation state |
 | `GET` | `/r/:id` | Public HTML receipt |
+| `GET` | `/c/:token` | Confirm page. Does not decide. |
+| `POST` | `/c/:token/confirm` | One-time confirm |
+| `POST` | `/c/:token/decline` | One-time decline |
 | `POST` | `/v1/wallets` | Open wallet |
 | `POST` | `/v1/wallets/:id/checkout` | Stripe top-up (auth) |
 | `GET` | `/v1/catalog` | List SKUs |
@@ -168,6 +199,8 @@ Full curl examples for wallets, Checkout, Stripe webhook setup on Render, and es
 | `STRIPE_WEBHOOK_SECRET` | `whsec_…` for `checkout.session.completed` |
 | `PUBLIC_BASE_URL` | `https://botsupply.onrender.com` |
 | `RECEIPT_SIGNING_KEY` | Long random secret for receipt HMAC |
+| `RECEIPT_CONFIRM_TTL_SECONDS` | Confirm link lifetime. Default 86400 (24 hours). |
+| `RECEIPT_EMAIL_PROVIDER` | Leave unset. No email provider ships in this build. |
 
 Webhook endpoint: `https://botsupply.onrender.com/v1/stripe/webhook`.
 
@@ -177,7 +210,7 @@ Webhook endpoint: `https://botsupply.onrender.com/v1/stripe/webhook`.
 npm test
 ```
 
-Covers wallets, DEV top-up, catalog purchases, Stripe credit application (fake client), escrow hold/release/refund/fee/idempotency/mode isolation, and purchase receipts (create, proof, verify, tamper, edit token, over-cap, mode isolation, per-IP limit).
+Covers wallets, DEV top-up, catalog purchases, Stripe credit application (fake client), escrow hold/release/refund/fee/idempotency/mode isolation, and purchase receipts (create, proof, verify, tamper, edit token, over-cap, mode isolation, per-IP limit, confirm-link issue, single use, expiry, confirm, decline, and page states).
 
 ## Deploy
 

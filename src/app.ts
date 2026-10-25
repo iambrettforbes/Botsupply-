@@ -1,6 +1,9 @@
 import { Readable } from "node:stream";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
+import { type ApprovalNotifier, approvalNotifierFromEnv } from "./approval-notifier.js";
 import { catalogDocument, findProduct } from "./catalog.js";
+import { renderConfirmForm, renderConfirmMessage, renderConfirmResult } from "./confirm-page.js";
+import { type ConfirmationWebhook, liveConfirmationWebhook } from "./confirmation-webhook.js";
 import { openStore, type JobRow, type SettleJobResult, type Store, type WalletRow } from "./db.js";
 import {
   ESCROW_AMOUNT_MAX,
@@ -13,12 +16,17 @@ import { renderLanding, type LandingQuery } from "./landing.js";
 import { mountMcp } from "./mcp.js";
 import { renderReceiptPage } from "./receipt-page.js";
 import {
+  CONFIRM_RATE_LIMIT_MAX,
+  CONFIRM_RATE_WINDOW_MS,
   RECEIPT_RATE_LIMIT_MAX,
   RECEIPT_RATE_WINDOW_MS,
   clientIp,
   createRateLimiter,
   parseApprovalBody,
   parseProofBody,
+  publicApproverConfirmation,
+  readConfirmTtlMs,
+  redactConfirmToken,
   resolveReceiptSigningKey,
   toPublicReceipt,
   verifyReceiptRecord,
@@ -52,6 +60,14 @@ export type BuildOptions = {
   receiptSigningKey?: string;
   /** Overrides the per-IP limit on `POST /v1/receipts`. */
   receiptRateLimit?: { max: number; windowMs: number };
+  /** Life of a confirm link. Overrides `RECEIPT_CONFIRM_TTL_SECONDS`. */
+  confirmTtlMs?: number;
+  /** Overrides the per-IP limit on `/c/:token`. */
+  confirmRateLimit?: { max: number; windowMs: number };
+  /** Overrides the env email notifier. Unconfigured notifiers do not send. */
+  approvalNotifier?: ApprovalNotifier;
+  /** Overrides the confirmation webhook POST. Failures must not throw. */
+  confirmationWebhook?: ConfirmationWebhook;
 };
 
 const MAX_TOPUP = 1_000_000;
@@ -250,7 +266,22 @@ async function openHostedCheckout(
 }
 
 export async function buildApp(options: BuildOptions): Promise<FastifyInstance> {
-  const app = Fastify({ logger: options.logger ?? false });
+  const app = Fastify({
+    logger: options.logger
+      ? {
+          serializers: {
+            req(request) {
+              return {
+                method: request.method,
+                url: redactConfirmToken(request.url),
+                hostname: request.hostname,
+                remoteAddress: request.ip,
+              };
+            },
+          },
+        }
+      : false,
+  });
   const stripe = options.stripe ?? stripeFromEnv();
   const mode = options.mode ?? stripe.mode;
   const escrowFeeBps = readEscrowFeeBps(process.env.ESCROW_FEE_BPS, options.escrowFeeBps);
@@ -259,11 +290,19 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     options.receiptRateLimit?.max ?? RECEIPT_RATE_LIMIT_MAX,
     options.receiptRateLimit?.windowMs ?? RECEIPT_RATE_WINDOW_MS,
   );
+  const confirmLimiter = createRateLimiter(
+    options.confirmRateLimit?.max ?? CONFIRM_RATE_LIMIT_MAX,
+    options.confirmRateLimit?.windowMs ?? CONFIRM_RATE_WINDOW_MS,
+  );
+  const notifier = options.approvalNotifier ?? approvalNotifierFromEnv();
+  const confirmationWebhook = options.confirmationWebhook ?? liveConfirmationWebhook();
+  readConfirmTtlMs(process.env.RECEIPT_CONFIRM_TTL_SECONDS, options.confirmTtlMs);
   const store = await openStore({
     databaseUrl: options.databaseUrl,
     sqlitePath: options.sqlitePath ?? ":memory:",
     mode,
     receiptSigningKey: receiptKey,
+    confirmTtlMs: options.confirmTtlMs,
   });
 
   app.addHook("onClose", async () => {
@@ -281,6 +320,14 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     rawBodies.set(request, raw);
     return Readable.from(raw);
   });
+
+  app.addContentTypeParser(
+    "application/x-www-form-urlencoded",
+    { parseAs: "string" },
+    (_request, body, done) => {
+      done(null, body);
+    },
+  );
 
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof ApiError) {
@@ -601,14 +648,33 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     return publicJob(result.job, result, false);
   });
 
-  function receiptUrlFor(request: FastifyRequest, id: string): string {
+  function publicOrigin(request: FastifyRequest): string {
     const configured = process.env.PUBLIC_BASE_URL?.trim().replace(/\/$/, "") ?? "";
-    if (configured) return `${configured}/r/${encodeURIComponent(id)}`;
+    if (configured) return configured;
     const forwardedHost = headerValue(request.headers["x-forwarded-host"]);
     const host = forwardedHost || headerValue(request.headers.host) || request.hostname;
     const forwardedProto = headerValue(request.headers["x-forwarded-proto"]);
     const proto = forwardedProto || request.protocol || "http";
-    return `${proto}://${host}/r/${encodeURIComponent(id)}`;
+    return `${proto}://${host}`;
+  }
+
+  function receiptUrlFor(request: FastifyRequest, id: string): string {
+    return `${publicOrigin(request)}/r/${encodeURIComponent(id)}`;
+  }
+
+  function confirmUrlFor(request: FastifyRequest, token: string): string {
+    return `${publicOrigin(request)}/c/${encodeURIComponent(token)}`;
+  }
+
+  function sendConfirmHtml(reply: FastifyReply, status: number, html: string) {
+    return reply
+      .status(status)
+      .header("cache-control", "no-store")
+      .header("referrer-policy", "no-referrer")
+      .header("x-robots-tag", "noindex")
+      .header("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'")
+      .type("text/html; charset=utf-8")
+      .send(html);
   }
 
   app.post("/v1/receipts", async (request, reply) => {
@@ -634,14 +700,45 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
       "price_cap_currency",
       "payment_rail",
       "external_payment_ref",
+      "confirmation_webhook_url",
     ]);
     const parsed = parseApprovalBody(body);
     if (!parsed.ok) throw new ApiError(400, "bad_request", parsed.message);
     const created = await store.createReceipt(parsed.value);
-    return reply.status(201).send({
+    const payload: Record<string, unknown> = {
       ...toPublicReceipt(created.receipt, receiptUrlFor(request, created.receipt.id)),
       edit_token: created.editToken,
-    });
+    };
+    if (created.confirmation) {
+      const confirmUrl = confirmUrlFor(request, created.confirmation.token);
+      let delivered = false;
+      if (notifier.configured && created.confirmation.channel === "email" && parsed.value.confirmContact) {
+        try {
+          await notifier.send({
+            channel: "email",
+            to: parsed.value.confirmContact.address,
+            confirmUrl,
+            receiptId: created.receipt.id,
+            merchantName: created.receipt.merchant_name,
+            scope: created.receipt.scope,
+            priceCapAmount: created.receipt.price_cap_amount,
+            priceCapCurrency: created.receipt.price_cap_currency,
+            agentLabel: created.receipt.agent_name ?? created.receipt.agent_id,
+            expiresAt: created.confirmation.expiresAt,
+          });
+          delivered = true;
+        } catch (error) {
+          request.log.error({ err: error instanceof Error ? error.message : "send failed" }, "approver email failed");
+          delivered = false;
+        }
+      }
+      payload.confirm_expires_at = created.confirmation.expiresAt;
+      payload.confirm_channel = created.confirmation.channel;
+      payload.confirm_contact_masked = created.confirmation.contactMasked;
+      payload.confirm_delivery = delivered ? "email" : "caller";
+      if (!delivered) payload.confirm_url = confirmUrl;
+    }
+    return reply.status(201).send(payload);
   });
 
   app.post("/v1/receipts/:id/proof", async (request) => {
@@ -680,6 +777,107 @@ export async function buildApp(options: BuildOptions): Promise<FastifyInstance> 
     reply.header("cache-control", "no-store");
     return toPublicReceipt(receipt, receiptUrlFor(request, receipt.id));
   });
+
+  function confirmLimited(request: FastifyRequest, reply: FastifyReply): boolean {
+    const decision = confirmLimiter.take(clientIp(request.headers["x-forwarded-for"], request.ip));
+    if (decision.ok) return false;
+    reply.header("retry-after", String(decision.retryAfterSec));
+    void sendConfirmHtml(
+      reply,
+      429,
+      renderConfirmMessage("Too many attempts", "Too many confirmation attempts from this address. Try again shortly."),
+    );
+    return true;
+  }
+
+  function agentLabel(receipt: { agent_name: string | null; agent_id: string | null }): string {
+    const parts = [receipt.agent_name, receipt.agent_id].filter((part) => part && part.length > 0);
+    return parts.length > 0 ? parts.join(" · ") : "Not recorded";
+  }
+
+  app.get("/c/:token", async (request, reply) => {
+    if (confirmLimited(request, reply)) return;
+    const { token } = request.params as { token: string };
+    const found = await store.readConfirmation(token);
+    if (!found.ok) {
+      return sendConfirmHtml(reply, 404, renderConfirmMessage("Link not valid", "This confirmation link is not valid."));
+    }
+    const view = found.confirmation;
+    if (view.state === "expired") {
+      return sendConfirmHtml(reply, 410, renderConfirmMessage("Link expired", "This confirmation link has expired."));
+    }
+    if (view.state === "used") {
+      const how = view.decision === "declined" ? "decline" : "confirm";
+      return sendConfirmHtml(
+        reply,
+        409,
+        renderConfirmMessage("Link already used", `This confirmation link was already used to ${how} this receipt.`),
+      );
+    }
+    return sendConfirmHtml(
+      reply,
+      200,
+      renderConfirmForm({
+        token,
+        scope: view.receipt.scope,
+        priceCapAmount: view.receipt.price_cap_amount,
+        priceCapCurrency: view.receipt.price_cap_currency,
+        merchantName: view.receipt.merchant_name,
+        agentLabel: agentLabel(view.receipt),
+        expiresAt: view.expiresAt,
+      }),
+    );
+  });
+
+  async function postDecision(request: FastifyRequest, reply: FastifyReply, decision: "confirm" | "decline") {
+    if (confirmLimited(request, reply)) return;
+    const { token } = request.params as { token: string };
+    const result = await store.decideConfirmation(token, decision);
+    if (!result.ok) {
+      if (result.code === "expired") {
+        return sendConfirmHtml(reply, 410, renderConfirmMessage("Link expired", "This confirmation link has expired."));
+      }
+      if (result.code === "used" || result.code === "already_decided") {
+        const again = await store.readConfirmation(token);
+        const prior = again.ok ? again.confirmation.decision : null;
+        const how = prior === "declined" ? "decline" : prior === "confirmed" ? "confirm" : "record a decision on";
+        const message =
+          result.code === "already_decided" && !prior
+            ? "This receipt already has a confirmation decision."
+            : `This confirmation link was already used to ${how} this receipt.`;
+        return sendConfirmHtml(reply, 409, renderConfirmMessage("Link already used", message));
+      }
+      if (result.code === "tampered") {
+        return sendConfirmHtml(
+          reply,
+          409,
+          renderConfirmMessage(
+            "Receipt cannot be confirmed",
+            "This receipt no longer matches its record, so it cannot be confirmed or declined.",
+          ),
+        );
+      }
+      return sendConfirmHtml(reply, 404, renderConfirmMessage("Link not valid", "This confirmation link is not valid."));
+    }
+    if (result.webhookUrl) {
+      try {
+        await confirmationWebhook.post(result.webhookUrl, {
+          receipt_id: result.receipt.id,
+          approver_confirmation: publicApproverConfirmation(result.receipt),
+        });
+      } catch (error) {
+        request.log.error({ err: error instanceof Error ? error.message : "webhook failed" }, "confirmation webhook failed");
+      }
+    }
+    return sendConfirmHtml(
+      reply,
+      200,
+      renderConfirmResult(decision === "confirm" ? "confirmed" : "declined", `/r/${encodeURIComponent(result.receipt.id)}`),
+    );
+  }
+
+  app.post("/c/:token/confirm", async (request, reply) => postDecision(request, reply, "confirm"));
+  app.post("/c/:token/decline", async (request, reply) => postDecision(request, reply, "decline"));
 
   app.get("/r/:id", async (request, reply) => {
     const { id } = request.params as { id: string };

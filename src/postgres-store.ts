@@ -1,9 +1,18 @@
 import { Pool, type PoolClient } from "pg";
 import { clampFeeBps, escrowFeeCredits } from "./escrow.js";
 import {
+  asContactChannel,
   assembleReceipt,
+  confirmExpiresAt,
+  confirmTokenState,
+  hashApproverContact,
+  hashConfirmToken,
+  isConfirmToken,
+  newConfirmToken,
   planApproval,
+  planApproverDecision,
   planProof,
+  type CreateReceiptInput,
   type ReceiptEvent,
   type ReceiptEventRow,
   type ReceiptHeaderRow,
@@ -27,7 +36,10 @@ import {
   type CheckoutSessionSave,
   type CreateJobInput,
   type CreateJobResult,
+  type CreateReceiptResult,
+  type DecideConfirmationResult,
   type JobBalances,
+  type ReadConfirmationResult,
   type JobRow,
   type PurchaseResult,
   type SettleJobResult,
@@ -107,8 +119,16 @@ const SCHEMA = [
     status TEXT NOT NULL CHECK (status IN ('approved', 'delivered', 'disputed')),
     content_hash TEXT NOT NULL,
     signature TEXT NOT NULL,
-    edit_token_hash TEXT NOT NULL
+    edit_token_hash TEXT NOT NULL,
+    approver_decision TEXT,
+    approver_decision_at TEXT,
+    approver_decision_channel TEXT,
+    approver_contact_masked TEXT
   )`,
+  `ALTER TABLE receipts ADD COLUMN IF NOT EXISTS approver_decision TEXT`,
+  `ALTER TABLE receipts ADD COLUMN IF NOT EXISTS approver_decision_at TEXT`,
+  `ALTER TABLE receipts ADD COLUMN IF NOT EXISTS approver_decision_channel TEXT`,
+  `ALTER TABLE receipts ADD COLUMN IF NOT EXISTS approver_contact_masked TEXT`,
   `CREATE INDEX IF NOT EXISTS idx_receipts_mode_id ON receipts (mode, id)`,
   `CREATE TABLE IF NOT EXISTS receipt_proofs (
     id TEXT PRIMARY KEY,
@@ -135,6 +155,21 @@ const SCHEMA = [
     UNIQUE (receipt_id, seq)
   )`,
   `CREATE INDEX IF NOT EXISTS idx_receipt_events_receipt ON receipt_events (mode, receipt_id, seq)`,
+  `CREATE TABLE IF NOT EXISTS receipt_confirm_tokens (
+    id TEXT PRIMARY KEY,
+    receipt_id TEXT NOT NULL REFERENCES receipts(id),
+    mode TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    contact_hash TEXT NOT NULL,
+    contact_masked TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    decision TEXT,
+    webhook_url TEXT,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_receipt_confirm_tokens_receipt ON receipt_confirm_tokens (mode, receipt_id)`,
 ];
 
 const JOB_COLUMNS =
@@ -182,12 +217,24 @@ async function withTransaction<T>(pool: Pool, run: (client: PoolClient) => Promi
 
 const RECEIPT_HEADER = `id, mode, created_at, updated_at, approver_name, approver_contact_hash, agent_id, agent_name,
   merchant_name, merchant_url, scope, price_cap_amount, price_cap_currency, payment_rail,
-  external_payment_ref, status, content_hash, signature, edit_token_hash`;
+  external_payment_ref, status, content_hash, signature, edit_token_hash,
+  approver_decision, approver_decision_at, approver_decision_channel, approver_contact_masked`;
+
+type ConfirmTokenRow = {
+  receipt_id: string;
+  channel: string;
+  contact_masked: string;
+  expires_at: string | Date;
+  used_at: string | Date | null;
+  decision: string | null;
+  webhook_url: string | null;
+};
 
 export async function openPostgresStore(
   connectionString: string,
   mode: StripeMode,
   receiptKey: Buffer,
+  confirmTtlMs = 86_400_000,
   pool = createPostgresPool(connectionString),
 ): Promise<Store> {
   try {
@@ -559,9 +606,10 @@ export async function openPostgresStore(
       return withTransaction(pool, async (client) => {
         await insertReceipt(client, planned.record);
         await insertReceiptEvent(client, planned.record.id, planned.event);
+        const confirmation = await insertConfirmation(client, planned.record.id, input, planned.record.created_at);
         const saved = await loadReceipt(client, planned.record.id);
         if (!saved) throw new Error(`Receipt disappeared: ${planned.record.id}`);
-        return { receipt: saved, editToken: planned.editToken };
+        return { receipt: saved, editToken: planned.editToken, confirmation };
       });
     },
     async getReceipt(id) {
@@ -607,7 +655,138 @@ export async function openPostgresStore(
         return { ok: true, receipt: saved, over_cap: planned.overCap };
       });
     },
+    async readConfirmation(token) {
+      return readConfirmation(pool, token);
+    },
+    async decideConfirmation(token, decision) {
+      return withTransaction(pool, (client) => decideConfirmation(client, token, decision));
+    },
   };
+
+  async function insertConfirmation(
+    client: PoolClient,
+    receiptId: string,
+    input: CreateReceiptInput,
+    createdAt: string,
+  ): Promise<CreateReceiptResult["confirmation"]> {
+    if (!input.confirmContact) return null;
+    const token = newConfirmToken();
+    const expiresAt = confirmExpiresAt(createdAt, confirmTtlMs);
+    await client.query(
+      `INSERT INTO receipt_confirm_tokens (
+         id, receipt_id, mode, channel, contact_hash, contact_masked, token_hash,
+         expires_at, webhook_url, created_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [
+        newId("cfm"),
+        receiptId,
+        mode,
+        input.confirmContact.channel,
+        hashApproverContact(input.confirmContact.address),
+        input.confirmContact.masked,
+        hashConfirmToken(token),
+        expiresAt,
+        input.confirmationWebhookUrl,
+        createdAt,
+      ],
+    );
+    return {
+      token,
+      expiresAt,
+      channel: input.confirmContact.channel,
+      contactMasked: input.confirmContact.masked,
+    };
+  }
+
+  function tokenTime(value: string | Date | null): string | null {
+    if (value == null) return null;
+    return value instanceof Date ? value.toISOString() : value;
+  }
+
+  async function selectConfirmToken(client: Pool | PoolClient, token: string, lock: boolean): Promise<ConfirmTokenRow | undefined> {
+    if (!isConfirmToken(token)) return undefined;
+    const result = await client.query(
+      `SELECT receipt_id, channel, contact_masked, expires_at, used_at, decision, webhook_url
+       FROM receipt_confirm_tokens WHERE token_hash = $1 AND mode = $2${lock ? " FOR UPDATE" : ""}`,
+      [hashConfirmToken(token), mode],
+    );
+    return result.rows[0] as ConfirmTokenRow | undefined;
+  }
+
+  async function readConfirmation(client: Pool | PoolClient, token: string): Promise<ReadConfirmationResult> {
+    const row = await selectConfirmToken(client, token, false);
+    if (!row) return { ok: false, code: "not_found" };
+    const receipt = await loadReceipt(client, row.receipt_id);
+    if (!receipt) return { ok: false, code: "not_found" };
+    const expiresAt = tokenTime(row.expires_at) ?? "";
+    const usedAt = tokenTime(row.used_at);
+    const decision = row.decision === "confirmed" || row.decision === "declined" ? row.decision : null;
+    return {
+      ok: true,
+      confirmation: {
+        state: confirmTokenState(expiresAt, usedAt, new Date().toISOString()),
+        receipt,
+        channel: asContactChannel(row.channel),
+        contactMasked: row.contact_masked,
+        expiresAt,
+        decision,
+        webhookUrl: row.webhook_url,
+      },
+    };
+  }
+
+  async function decideConfirmation(
+    client: PoolClient,
+    token: string,
+    decision: "confirm" | "decline",
+  ): Promise<DecideConfirmationResult> {
+    const row = await selectConfirmToken(client, token, true);
+    if (!row) return { ok: false, code: "not_found" };
+    const now = new Date().toISOString();
+    const expiresAt = tokenTime(row.expires_at) ?? "";
+    const usedAt = tokenTime(row.used_at);
+    const state = confirmTokenState(expiresAt, usedAt, now);
+    if (state === "used") return { ok: false, code: "used" };
+    if (state === "expired") return { ok: false, code: "expired" };
+    const current = await loadReceipt(client, row.receipt_id);
+    if (!current) return { ok: false, code: "not_found" };
+    const planned = planApproverDecision(
+      current,
+      { decision, channel: asContactChannel(row.channel), contactMasked: row.contact_masked },
+      now,
+      receiptKey,
+    );
+    if (!planned.ok) return planned;
+    const marked = await client.query(
+      `UPDATE receipt_confirm_tokens
+       SET used_at = $1, decision = $2
+       WHERE token_hash = $3 AND mode = $4 AND used_at IS NULL`,
+      [now, planned.decision, hashConfirmToken(token), mode],
+    );
+    if ((marked.rowCount ?? 0) !== 1) return { ok: false, code: "used" };
+    await insertReceiptEvent(client, row.receipt_id, planned.event);
+    const updated = await client.query(
+      `UPDATE receipts
+       SET approver_decision = $1, approver_decision_at = $2, approver_decision_channel = $3,
+           approver_contact_masked = $4, content_hash = $5, signature = $6, updated_at = $7
+       WHERE id = $8 AND mode = $9`,
+      [
+        planned.decision,
+        planned.updatedAt,
+        planned.channel,
+        planned.contactMasked,
+        planned.contentHash,
+        planned.signature,
+        planned.updatedAt,
+        row.receipt_id,
+        mode,
+      ],
+    );
+    if ((updated.rowCount ?? 0) !== 1) throw new Error(`Receipt confirmation update missed ${row.receipt_id}`);
+    const saved = await loadReceipt(client, row.receipt_id);
+    if (!saved) throw new Error(`Receipt disappeared: ${row.receipt_id}`);
+    return { ok: true, receipt: saved, webhookUrl: row.webhook_url };
+  }
 
   async function loadReceipt(client: Pool | PoolClient, id: string) {
     const headerResult = await client.query(`SELECT ${RECEIPT_HEADER} FROM receipts WHERE id = $1 AND mode = $2`, [

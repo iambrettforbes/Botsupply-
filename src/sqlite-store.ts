@@ -3,8 +3,16 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { clampFeeBps, escrowFeeCredits } from "./escrow.js";
 import {
+  asContactChannel,
   assembleReceipt,
+  confirmExpiresAt,
+  confirmTokenState,
+  hashApproverContact,
+  hashConfirmToken,
+  isConfirmToken,
+  newConfirmToken,
   planApproval,
+  planApproverDecision,
   planProof,
   type ReceiptEventRow,
   type ReceiptHeaderRow,
@@ -27,6 +35,8 @@ import {
   type CreateJobInput,
   type CreateJobResult,
   type CreateReceiptResult,
+  type DecideConfirmationResult,
+  type ReadConfirmationResult,
   type JobBalances,
   type JobRow,
   type PurchaseResult,
@@ -108,7 +118,11 @@ const SCHEMA = `
     status TEXT NOT NULL CHECK (status IN ('approved', 'delivered', 'disputed')),
     content_hash TEXT NOT NULL,
     signature TEXT NOT NULL,
-    edit_token_hash TEXT NOT NULL
+    edit_token_hash TEXT NOT NULL,
+    approver_decision TEXT,
+    approver_decision_at TEXT,
+    approver_decision_channel TEXT,
+    approver_contact_masked TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_receipts_mode_id ON receipts (mode, id);
   CREATE TABLE IF NOT EXISTS receipt_proofs (
@@ -136,6 +150,21 @@ const SCHEMA = `
     UNIQUE (receipt_id, seq)
   );
   CREATE INDEX IF NOT EXISTS idx_receipt_events_receipt ON receipt_events (mode, receipt_id, seq);
+  CREATE TABLE IF NOT EXISTS receipt_confirm_tokens (
+    id TEXT PRIMARY KEY,
+    receipt_id TEXT NOT NULL REFERENCES receipts(id),
+    mode TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    contact_hash TEXT NOT NULL,
+    contact_masked TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    decision TEXT,
+    webhook_url TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_receipt_confirm_tokens_receipt ON receipt_confirm_tokens (mode, receipt_id);
 `;
 
 const JOB_SELECT = `id, payer_wallet_id, payee_wallet_id, amount_credits, description, status,
@@ -171,14 +200,46 @@ function openSqlite(sqlitePath: string): Database.Database {
   }
   migrateLegacyMode(db);
   db.exec(SCHEMA);
+  migrateReceiptConfirmation(db);
   return db;
+}
+
+/** Adds confirmation columns to receipts created before confirm links. Existing rows stay null. */
+function migrateReceiptConfirmation(db: Database.Database): void {
+  if (!tableExists(db, "receipts")) return;
+  const columns = tableColumns(db, "receipts");
+  for (const column of [
+    "approver_decision",
+    "approver_decision_at",
+    "approver_decision_channel",
+    "approver_contact_masked",
+  ]) {
+    if (columns.includes(column)) continue;
+    db.exec(`ALTER TABLE receipts ADD COLUMN ${column} TEXT`);
+  }
 }
 
 const RECEIPT_HEADER = `id, mode, created_at, updated_at, approver_name, approver_contact_hash, agent_id, agent_name,
   merchant_name, merchant_url, scope, price_cap_amount, price_cap_currency, payment_rail,
-  external_payment_ref, status, content_hash, signature, edit_token_hash`;
+  external_payment_ref, status, content_hash, signature, edit_token_hash,
+  approver_decision, approver_decision_at, approver_decision_channel, approver_contact_masked`;
 
-export function openSqliteStore(sqlitePath: string, mode: StripeMode, receiptKey: Buffer): Store {
+type ConfirmTokenRow = {
+  receipt_id: string;
+  channel: string;
+  contact_masked: string;
+  expires_at: string;
+  used_at: string | null;
+  decision: string | null;
+  webhook_url: string | null;
+};
+
+export function openSqliteStore(
+  sqlitePath: string,
+  mode: StripeMode,
+  receiptKey: Buffer,
+  confirmTtlMs = 86_400_000,
+): Store {
   const db = openSqlite(sqlitePath);
 
   function findWalletById(id: string): WalletRow | undefined {
@@ -398,9 +459,10 @@ export function openSqliteStore(sqlitePath: string, mode: StripeMode, receiptKey
       const run = db.transaction((): CreateReceiptResult => {
         insertReceipt(planned.record);
         insertReceiptEvent(planned.record.id, planned.event);
+        const confirmation = insertConfirmation(planned.record.id, input, planned.record.created_at);
         const saved = loadReceipt(planned.record.id);
         if (!saved) throw new Error(`Receipt disappeared: ${planned.record.id}`);
-        return { receipt: saved, editToken: planned.editToken };
+        return { receipt: saved, editToken: planned.editToken, confirmation };
       });
       return run.immediate();
     },
@@ -443,7 +505,127 @@ export function openSqliteStore(sqlitePath: string, mode: StripeMode, receiptKey
       });
       return run.immediate();
     },
+    async readConfirmation(token) {
+      return readConfirmation(token);
+    },
+    async decideConfirmation(token, decision) {
+      const run = db.transaction((): DecideConfirmationResult => decideConfirmation(token, decision));
+      return run.immediate();
+    },
   };
+
+  function insertConfirmation(
+    receiptId: string,
+    input: Parameters<Store["createReceipt"]>[0],
+    createdAt: string,
+  ): CreateReceiptResult["confirmation"] {
+    if (!input.confirmContact) return null;
+    const token = newConfirmToken();
+    const expiresAt = confirmExpiresAt(createdAt, confirmTtlMs);
+    db.prepare(
+      `INSERT INTO receipt_confirm_tokens (
+         id, receipt_id, mode, channel, contact_hash, contact_masked, token_hash,
+         expires_at, webhook_url, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      newId("cfm"),
+      receiptId,
+      mode,
+      input.confirmContact.channel,
+      hashApproverContact(input.confirmContact.address),
+      input.confirmContact.masked,
+      hashConfirmToken(token),
+      expiresAt,
+      input.confirmationWebhookUrl,
+      createdAt,
+    );
+    return {
+      token,
+      expiresAt,
+      channel: input.confirmContact.channel,
+      contactMasked: input.confirmContact.masked,
+    };
+  }
+
+  function selectConfirmToken(token: string): ConfirmTokenRow | undefined {
+    if (!isConfirmToken(token)) return undefined;
+    return db
+      .prepare(
+        `SELECT receipt_id, channel, contact_masked, expires_at, used_at, decision, webhook_url
+         FROM receipt_confirm_tokens WHERE token_hash = ? AND mode = ?`,
+      )
+      .get(hashConfirmToken(token), mode) as ConfirmTokenRow | undefined;
+  }
+
+  function readConfirmation(token: string): ReadConfirmationResult {
+    const row = selectConfirmToken(token);
+    if (!row) return { ok: false, code: "not_found" };
+    const receipt = loadReceipt(row.receipt_id);
+    if (!receipt) return { ok: false, code: "not_found" };
+    const now = new Date().toISOString();
+    const decision = row.decision === "confirmed" || row.decision === "declined" ? row.decision : null;
+    return {
+      ok: true,
+      confirmation: {
+        state: confirmTokenState(row.expires_at, row.used_at, now),
+        receipt,
+        channel: asContactChannel(row.channel),
+        contactMasked: row.contact_masked,
+        expiresAt: row.expires_at,
+        decision,
+        webhookUrl: row.webhook_url,
+      },
+    };
+  }
+
+  function decideConfirmation(token: string, decision: "confirm" | "decline"): DecideConfirmationResult {
+    const row = selectConfirmToken(token);
+    if (!row) return { ok: false, code: "not_found" };
+    const now = new Date().toISOString();
+    const state = confirmTokenState(row.expires_at, row.used_at, now);
+    if (state === "used") return { ok: false, code: "used" };
+    if (state === "expired") return { ok: false, code: "expired" };
+    const current = loadReceipt(row.receipt_id);
+    if (!current) return { ok: false, code: "not_found" };
+    const planned = planApproverDecision(
+      current,
+      { decision, channel: asContactChannel(row.channel), contactMasked: row.contact_masked },
+      now,
+      receiptKey,
+    );
+    if (!planned.ok) return planned;
+    const marked = db
+      .prepare(
+        `UPDATE receipt_confirm_tokens
+         SET used_at = ?, decision = ?
+         WHERE token_hash = ? AND mode = ? AND used_at IS NULL`,
+      )
+      .run(now, planned.decision, hashConfirmToken(token), mode);
+    if (marked.changes !== 1) return { ok: false, code: "used" };
+    insertReceiptEvent(row.receipt_id, planned.event);
+    const updated = db
+      .prepare(
+        `UPDATE receipts
+         SET approver_decision = ?, approver_decision_at = ?, approver_decision_channel = ?,
+             approver_contact_masked = ?, content_hash = ?, signature = ?, updated_at = ?
+         WHERE id = ? AND mode = ?`,
+      )
+      .run(
+        planned.decision,
+        planned.updatedAt,
+        planned.channel,
+        planned.contactMasked,
+        planned.contentHash,
+        planned.signature,
+        planned.updatedAt,
+        row.receipt_id,
+        mode,
+      );
+    if (updated.changes !== 1) throw new Error(`Receipt confirmation update missed ${row.receipt_id}`);
+    const saved = loadReceipt(row.receipt_id);
+    if (!saved) throw new Error(`Receipt disappeared: ${row.receipt_id}`);
+    return { ok: true, receipt: saved, webhookUrl: row.webhook_url };
+  }
 
   function loadReceipt(id: string) {
     const header = db

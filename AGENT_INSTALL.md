@@ -63,7 +63,7 @@ curl -s -X POST "$BASE/v1/receipts" \
   -d '{"approver":"Ada","approver_contact":"ada@example.com","agent_name":"Desk Agent","merchant_name":"North Market","merchant_url":"https://north.example/shop","scope":"Two bags of coffee","price_cap_amount":"25.00","price_cap_currency":"USD","payment_rail":"stripe_link"}'
 ```
 
-Save `edit_token` from that response. It is shown once. `approver_contact` is stored only as a hash and is never returned. Attach proof with the token:
+Save `edit_token` from that response. It is shown once. When `approver_contact` is an email and no email provider is configured, also save `confirm_url`. It is shown once. BotSupply does not send it. The caller delivers it. The address is stored only as a hash and is never returned. A non-email contact is hashed and does not issue a link. Attach proof with the edit token:
 
 ```bash
 curl -s -X POST "$BASE/v1/receipts/$RECEIPT_ID/proof" \
@@ -71,7 +71,7 @@ curl -s -X POST "$BASE/v1/receipts/$RECEIPT_ID/proof" \
   -d '{"edit_token":"'"$EDIT_TOKEN"'","type":"order_confirmation","value":"ord_123","actual_amount":"24.50"}'
 ```
 
-The first proof moves the receipt from `approved` to `delivered`. `"status":"disputed"` disputes it. `over_cap` is true when `actual_amount` is above the price cap. The public page is `GET /r/:id`. Verified means the record hasn't changed since it was created. It doesn't confirm who approved. The approver is labeled as reported by the agent. `GET /v1/receipts/:id` is the JSON. `GET /v1/receipts/:id/verify` returns `valid` true or false after recomputing the hash chain and HMAC signature. `valid` does not confirm who approved. Operators set `RECEIPT_SIGNING_KEY` so that signature survives a restart. Receipts follow the same Stripe mode isolation as wallets.
+The first proof moves the receipt from `approved` to `delivered`. `"status":"disputed"` disputes it. `over_cap` is true when `actual_amount` is above the price cap. The public page is `GET /r/:id`. Verified means the record hasn't changed since it was created. It doesn't confirm who approved. The approver name is labeled as reported by the agent. A separate line is Approver unconfirmed, Approver confirmed ✓, or Approver declined. Confirmed means the person who opened the one-time link clicked Confirm. `GET /c/:token` shows the summary and does not decide; Confirm and Decline are POSTs and work once. `GET /v1/receipts/:id` is the JSON and includes `approver_confirmation`. `GET /v1/receipts/:id/verify` returns `valid` true or false after recomputing the hash chain and HMAC signature, plus the same confirmation state. `valid` does not confirm who approved. Optional `confirmation_webhook_url` is notified best-effort after the click; poll the receipt if it does not arrive. Operators set `RECEIPT_SIGNING_KEY` so that signature survives a restart. Leave `RECEIPT_EMAIL_PROVIDER` unset unless a sender is wired up. Receipts follow the same Stripe mode isolation as wallets.
 
 MCP: `record_approval`, `attach_proof`, `get_receipt`, `verify_receipt`. See [MCP_INSTALL.md](MCP_INSTALL.md).
 
