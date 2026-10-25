@@ -158,6 +158,8 @@ export function renderReceiptPage(receipt: PublicReceipt, verification: VerifyRe
       ? [receipt.agent_name, receipt.agent_id].filter((part) => part && part.length > 0).join(" · ")
       : "Not recorded";
   const ref = receipt.external_payment_ref ?? "None";
+  const hidden =
+    receipt.public_view === "redacted" ? `<p class="quiet">Some details hidden by the purchaser.</p>` : "";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -200,6 +202,7 @@ export function renderReceiptPage(receipt: PublicReceipt, verification: VerifyRe
     .explain { color: var(--muted); margin: 18px 0 0; max-width: 62ch; }
     .note { color: var(--muted); margin: 18px 0 0; }
     .explain + .note { margin-top: 8px; }
+    .quiet { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
     .confirm-state { margin-top: 16px; padding: 12px 14px; border: 1px solid var(--line); background: var(--bg-2); }
     .confirm-state strong { display: block; letter-spacing: 0.06em; text-transform: uppercase; font-size: 13px; }
     .confirm-state p { margin: 6px 0 0; color: var(--muted); }
@@ -259,6 +262,7 @@ export function renderReceiptPage(receipt: PublicReceipt, verification: VerifyRe
     </header>
     ${verifiedMeaning}
     <p class="note">${esc(note)} BotSupply did not hold or move the money. Rail: ${esc(receipt.payment_rail)}.</p>
+    ${hidden}
     ${confirmationBlock(receipt)}
     ${orderBlock(receipt)}
     <section>

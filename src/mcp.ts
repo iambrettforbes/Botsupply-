@@ -26,7 +26,7 @@ const INSTRUCTIONS = [
   "Auth is a wallet API key: Authorization: Bearer on the MCP connection, or the api_key tool argument returned once by open_wallet.",
   "Credits are prepaid. create_checkout returns a Stripe Checkout URL when that route is configured. This server does not mint credits.",
   "create_job holds the caller's credits in escrow for another agent's wallet. release_job pays the payee when the work is delivered. refund_job returns the hold to the payer. The payer authorizes release and refund. The payee can also refund to cancel. A platform fee, ESCROW_FEE_BPS, defaults to 0 and is withheld from the payee only on release.",
-  "record_approval writes a public record of what was reported as approved for a payment on any rail. The approver name is supplied by the calling agent and is not confirmation of who approved. If approver_contact is an email, BotSupply issues a one-time expiring confirm link. When no email provider is configured, confirm_url is returned and nothing is sent. confirmed means the person who opened that link clicked Confirm. Unconfirmed is the default. BotSupply does not hold or move that money. The paying agent must poll get_receipt and pay only when pay_allowed is true. pay_allowed is true when the approver confirmed, or when no approver_contact was given and the price cap is under RECEIPT_CONFIRM_THRESHOLD (default 100, in the price cap currency). At or above that threshold, a receipt with no email approver contact stays payable only after confirmation, which cannot happen without an email contact, so pay_allowed stays false. record_payment appends a signed payment_recorded event after the agent pays. It flags paid_before_confirmation and over_cap and does not reject those payments. attach_proof adds delivery proof with the edit_token from record_approval. get_receipt and verify_receipt are public and include approver_confirmation. verify_receipt checks that the record has not changed since it was created. It does not confirm who approved.",
+  "record_approval writes a public record of what was reported as approved for a payment on any rail. The approver name is supplied by the calling agent and is not confirmation of who approved. If approver_contact is an email, BotSupply issues a one-time expiring confirm link. When no email provider is configured, confirm_url is returned and nothing is sent. confirmed means the person who opened that link clicked Confirm. Unconfirmed is the default. BotSupply does not hold or move that money. The paying agent must poll get_receipt and pay only when pay_allowed is true. pay_allowed is true when the approver confirmed, or when no approver_contact was given and the price cap is under RECEIPT_CONFIRM_THRESHOLD (default 100, in the price cap currency). At or above that threshold, a receipt with no email approver contact stays payable only after confirmation, which cannot happen without an email contact, so pay_allowed stays false. record_payment appends a signed payment_recorded event after the agent pays. It flags paid_before_confirmation and over_cap and does not reject those payments. attach_proof adds delivery proof with the edit_token from record_approval. get_receipt and verify_receipt are public and include approver_confirmation. The public external_payment_ref is the latest recorded payment ref, and the top-level paid_before_confirmation and over_cap flags are true when any recorded payment has that flag. Those read fields are derived and do not rewrite the signed row. verify_receipt checks that the record has not changed since it was created. It does not confirm who approved. public_view is full or redacted and is stored outside the hash. set_receipt_visibility changes it with the edit_token. redacted public pages show approver initials, the agent name Agent, no email or phone, and payment refs and proof values as on file plus the last four characters.",
 ].join(" ");
 
 export type ApiResult = {
@@ -148,6 +148,8 @@ const recordApprovalSchema = fromJsonSchema<{
   price_cap_currency: string;
   payment_rail: string;
   external_payment_ref?: string;
+  public_view?: "full" | "redacted";
+  public_scope?: string;
 }>({
   type: "object",
   properties: {
@@ -218,6 +220,18 @@ const recordApprovalSchema = fromJsonSchema<{
       type: "string",
       maxLength: RECEIPT_REF_MAX,
       description: "Optional id from the payment rail. BotSupply does not look it up.",
+    },
+    public_view: {
+      type: "string",
+      enum: ["full", "redacted"],
+      description:
+        "Public display. full (default) or redacted. Stored outside the hash, so changing it later does not break verify. redacted shows initials, hides contacts, and shortens payment refs and proof values.",
+    },
+    public_scope: {
+      type: "string",
+      maxLength: RECEIPT_SCOPE_MAX,
+      description:
+        "Optional scope shown on the public receipt while public_view is redacted. The stored scope is unchanged and is what the approver confirms.",
     },
   },
   required: ["approver", "merchant_name", "scope", "price_cap_amount", "price_cap_currency", "payment_rail"],
@@ -293,6 +307,34 @@ const recordPaymentSchema = fromJsonSchema<{
     },
   },
   required: ["receipt_id", "edit_token", "external_payment_ref", "amount"],
+  additionalProperties: false,
+});
+
+const setVisibilitySchema = fromJsonSchema<{
+  receipt_id: string;
+  edit_token: string;
+  public_view: "full" | "redacted";
+  public_scope?: string;
+}>({
+  type: "object",
+  properties: {
+    receipt_id: { type: "string", description: "Receipt id from record_approval (rcpt_…)." },
+    edit_token: {
+      type: "string",
+      description: "Secret returned once by record_approval. Required to change the public view.",
+    },
+    public_view: {
+      type: "string",
+      enum: ["full", "redacted"],
+      description: "full shows the record with emails and phones masked. redacted hides purchaser details.",
+    },
+    public_scope: {
+      type: "string",
+      maxLength: RECEIPT_SCOPE_MAX,
+      description: "Optional. Replaces the scope on the public receipt while redacted. Omit to leave the stored public scope unchanged.",
+    },
+  },
+  required: ["receipt_id", "edit_token", "public_view"],
   additionalProperties: false,
 });
 
@@ -558,7 +600,7 @@ function registerTools(server: McpServer, client: BotSupplyClient, defaultApiKey
     {
       title: "Record reported approval",
       description:
-        "Write a record of what was reported as approved for a purchase on any payment rail. The approver is a name supplied by the calling agent; this does not confirm who approved. BotSupply does not hold or move the money. Returns receipt_id, a public receipt_url, and an edit_token shown once. If approver_contact is an email, also issues a single-use expiring confirm link. When no email provider is configured, the response includes confirm_url and nothing is sent; the caller delivers that link. A click is a signed hash-chain event. approver_confirmation.status stays unconfirmed until the person with access to that contact clicks Confirm or Decline. confirmed means that person clicked Confirm. It is not a legal-identity check, and an unconfirmed receipt is not a verification of the person. Without an email approver_contact, pay_allowed is true only when the price cap is under RECEIPT_CONFIRM_THRESHOLD (default 100, in the price cap currency). At or above that threshold the receipt still records and shows that confirmation is required, and pay_allowed stays false. Poll get_receipt and pay only when pay_allowed is true. No wallet or API key. Rate limited per IP. Same as POST /v1/receipts.",
+        "Write a record of what was reported as approved for a purchase on any payment rail. The approver is a name supplied by the calling agent; this does not confirm who approved. BotSupply does not hold or move the money. Returns receipt_id, a public receipt_url, and an edit_token shown once. If approver_contact is an email, also issues a single-use expiring confirm link. When no email provider is configured, the response includes confirm_url and nothing is sent; the caller delivers that link. A click is a signed hash-chain event. approver_confirmation.status stays unconfirmed until the person with access to that contact clicks Confirm or Decline. confirmed means that person clicked Confirm. It is not a legal-identity check, and an unconfirmed receipt is not a verification of the person. Without an email approver_contact, pay_allowed is true only when the price cap is under RECEIPT_CONFIRM_THRESHOLD (default 100, in the price cap currency). At or above that threshold the receipt still records and shows that confirmation is required, and pay_allowed stays false. Poll get_receipt and pay only when pay_allowed is true. Optional public_view is full (default) or redacted, with optional public_scope for the redacted public text. That display setting is outside the hash. No wallet or API key. Rate limited per IP. Same as POST /v1/receipts.",
       inputSchema: recordApprovalSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
@@ -577,7 +619,28 @@ function registerTools(server: McpServer, client: BotSupplyClient, defaultApiKey
       if (args.agent_name !== undefined) body.agent_name = args.agent_name;
       if (args.merchant_url !== undefined) body.merchant_url = args.merchant_url;
       if (args.external_payment_ref !== undefined) body.external_payment_ref = args.external_payment_ref;
+      if (args.public_view !== undefined) body.public_view = args.public_view;
+      if (args.public_scope !== undefined) body.public_scope = args.public_scope;
       return fromApi(await client.post("/v1/receipts", body));
+    },
+  );
+
+  server.registerTool(
+    "set_receipt_visibility",
+    {
+      title: "Set receipt public view",
+      description:
+        "Change a receipt's public display to full or redacted. Requires the edit_token from record_approval. Optional public_scope replaces the scope shown publicly while redacted. Stored outside the hash chain, so the content hash and verify result do not change. redacted shows the approver as initials, the agent name as Agent, no email or phone, and payment refs and proof values as on file plus the last 4 characters. Merchant name, merchant URL, amounts, cap, timeline, and statuses stay visible. BotSupply does not move money. Same as POST /v1/receipts/:id/visibility.",
+      inputSchema: setVisibilitySchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (args) => {
+      const body: Record<string, unknown> = {
+        edit_token: args.edit_token,
+        public_view: args.public_view,
+      };
+      if (args.public_scope !== undefined) body.public_scope = args.public_scope;
+      return fromApi(await client.post(`/v1/receipts/${encodeURIComponent(args.receipt_id)}/visibility`, body));
     },
   );
 
@@ -627,7 +690,7 @@ function registerTools(server: McpServer, client: BotSupplyClient, defaultApiKey
     {
       title: "Get purchase receipt",
       description:
-        "Read a public purchase receipt: what was reported as approved, scope, price cap, merchant, proofs, payments, content hash, approver_confirmation, and pay_allowed. status is unconfirmed, confirmed, or declined. confirmed means the person with access to the contact clicked Confirm, with time and channel. unconfirmed is the default and is not a verification of the person. pay_allowed is true only when approver_confirmation.status is confirmed, or when no approver_contact was given and the price cap is under RECEIPT_CONFIRM_THRESHOLD (default 100, in the price cap currency). Agents must poll get_receipt and pay only when pay_allowed is true. BotSupply does not move the money. The approver name is what the calling agent reported. No API key. The raw contact, confirm link, and edit token are not included. Poll this to learn the click result. Same as GET /v1/receipts/:id.",
+        "Read a public purchase receipt: what was reported as approved, scope, price cap, merchant, proofs, payments, content hash, approver_confirmation, pay_allowed, and public_view. external_payment_ref is the latest recorded payment ref, or the approval-time ref when no payment is recorded. paid_before_confirmation and over_cap are true when any recorded payment has that flag. Those three fields are derived at read time and do not change the signed row. status is unconfirmed, confirmed, or declined. confirmed means the person with access to the contact clicked Confirm, with time and channel. unconfirmed is the default and is not a verification of the person. pay_allowed is true only when approver_confirmation.status is confirmed, or when no approver_contact was given and the price cap is under RECEIPT_CONFIRM_THRESHOLD (default 100, in the price cap currency). Agents must poll get_receipt and pay only when pay_allowed is true. When public_view is redacted, the approver is initials, the agent name is Agent, contacts are omitted, and payment refs and proof values are on file plus the last 4 characters. BotSupply does not move the money. The approver name is what the calling agent reported. No API key. The raw contact, confirm link, and edit token are not included. Poll this to learn the click result. Same as GET /v1/receipts/:id.",
       inputSchema: receiptIdSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },

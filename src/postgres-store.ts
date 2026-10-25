@@ -6,6 +6,7 @@ import {
   confirmExpiresAt,
   confirmTokenState,
   hashApproverContact,
+  editTokenMatches,
   hashConfirmToken,
   isConfirmToken,
   newConfirmToken,
@@ -43,6 +44,7 @@ import {
   type JobBalances,
   type ReadConfirmationResult,
   type RecordPaymentResult,
+  type SetReceiptVisibilityResult,
   type JobRow,
   type PurchaseResult,
   type SettleJobResult,
@@ -126,12 +128,16 @@ const SCHEMA = [
     approver_decision TEXT,
     approver_decision_at TEXT,
     approver_decision_channel TEXT,
-    approver_contact_masked TEXT
+    approver_contact_masked TEXT,
+    public_view TEXT NOT NULL DEFAULT 'full',
+    public_scope TEXT
   )`,
   `ALTER TABLE receipts ADD COLUMN IF NOT EXISTS approver_decision TEXT`,
   `ALTER TABLE receipts ADD COLUMN IF NOT EXISTS approver_decision_at TEXT`,
   `ALTER TABLE receipts ADD COLUMN IF NOT EXISTS approver_decision_channel TEXT`,
   `ALTER TABLE receipts ADD COLUMN IF NOT EXISTS approver_contact_masked TEXT`,
+  `ALTER TABLE receipts ADD COLUMN IF NOT EXISTS public_view TEXT NOT NULL DEFAULT 'full'`,
+  `ALTER TABLE receipts ADD COLUMN IF NOT EXISTS public_scope TEXT`,
   `CREATE INDEX IF NOT EXISTS idx_receipts_mode_id ON receipts (mode, id)`,
   `CREATE TABLE IF NOT EXISTS receipt_proofs (
     id TEXT PRIMARY KEY,
@@ -236,7 +242,8 @@ async function withTransaction<T>(pool: Pool, run: (client: PoolClient) => Promi
 const RECEIPT_HEADER = `id, mode, created_at, updated_at, approver_name, approver_contact_hash, agent_id, agent_name,
   merchant_name, merchant_url, scope, price_cap_amount, price_cap_currency, payment_rail,
   external_payment_ref, status, content_hash, signature, edit_token_hash,
-  approver_decision, approver_decision_at, approver_decision_channel, approver_contact_masked`;
+  approver_decision, approver_decision_at, approver_decision_channel, approver_contact_masked,
+  public_view, public_scope`;
 
 type ConfirmTokenRow = {
   receipt_id: string;
@@ -692,6 +699,37 @@ export async function openPostgresStore(
         };
       });
     },
+    async setReceiptVisibility(input) {
+      return withTransaction(pool, async (client): Promise<SetReceiptVisibilityResult> => {
+        const locked = await client.query(`SELECT id FROM receipts WHERE id = $1 AND mode = $2 FOR UPDATE`, [
+          input.receiptId,
+          mode,
+        ]);
+        if (!locked.rows[0]) return { ok: false, code: "not_found" };
+        const current = await loadReceipt(client, input.receiptId);
+        if (!current) return { ok: false, code: "not_found" };
+        if (!editTokenMatches(current.edit_token_hash, input.editToken)) {
+          return { ok: false, code: "invalid_edit_token" };
+        }
+        if (input.publicScope === undefined) {
+          await client.query(`UPDATE receipts SET public_view = $1 WHERE id = $2 AND mode = $3`, [
+            input.publicView,
+            input.receiptId,
+            mode,
+          ]);
+        } else {
+          await client.query(`UPDATE receipts SET public_view = $1, public_scope = $2 WHERE id = $3 AND mode = $4`, [
+            input.publicView,
+            input.publicScope,
+            input.receiptId,
+            mode,
+          ]);
+        }
+        const saved = await loadReceipt(client, input.receiptId);
+        if (!saved) throw new Error(`Receipt disappeared: ${input.receiptId}`);
+        return { ok: true, receipt: saved };
+      });
+    },
     async attachReceiptProof(input) {
       return withTransaction(pool, async (client): Promise<AttachReceiptResult> => {
         const locked = await client.query(`SELECT id FROM receipts WHERE id = $1 AND mode = $2 FOR UPDATE`, [
@@ -906,8 +944,9 @@ export async function openPostgresStore(
       `INSERT INTO receipts (
          id, mode, created_at, updated_at, approver_name, approver_contact_hash, agent_id, agent_name,
          merchant_name, merchant_url, scope, price_cap_amount, price_cap_currency, payment_rail,
-         external_payment_ref, status, content_hash, signature, edit_token_hash
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
+         external_payment_ref, status, content_hash, signature, edit_token_hash,
+         public_view, public_scope
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
       [
         record.id,
         mode,
@@ -928,6 +967,8 @@ export async function openPostgresStore(
         record.content_hash,
         record.signature,
         record.edit_token_hash,
+        record.public_view,
+        record.public_scope,
       ],
     );
   }

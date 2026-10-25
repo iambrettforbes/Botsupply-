@@ -1,5 +1,12 @@
 import crypto from "node:crypto";
-import type { AttachProofInput, ContactChannel, CreateReceiptInput, ReceiptRecord, RecordPaymentInput } from "./receipts.js";
+import type {
+  AttachProofInput,
+  ContactChannel,
+  CreateReceiptInput,
+  PublicView,
+  ReceiptRecord,
+  RecordPaymentInput,
+} from "./receipts.js";
 import type { StripeMode } from "./stripe.js";
 
 export type StorageKind = "sqlite" | "postgres";
@@ -122,6 +129,18 @@ export type RecordPaymentResult =
   | { ok: true; receipt: ReceiptRecord; paid_before_confirmation: boolean; over_cap: boolean }
   | { ok: false; code: "not_found" | "invalid_edit_token" | "tampered" };
 
+export type SetReceiptVisibilityInput = {
+  receiptId: string;
+  editToken: string;
+  publicView: PublicView;
+  /** Undefined leaves the stored public scope unchanged. Null clears it. */
+  publicScope?: string | null;
+};
+
+export type SetReceiptVisibilityResult =
+  | { ok: true; receipt: ReceiptRecord }
+  | { ok: false; code: "not_found" | "invalid_edit_token" };
+
 export type ConfirmationView = {
   state: "open" | "used" | "expired";
   receipt: ReceiptRecord;
@@ -185,6 +204,10 @@ export type Store = {
    * Early and over-cap payments are stored and flagged. They are not rejected.
    */
   recordReceiptPayment(input: RecordPaymentInput): Promise<RecordPaymentResult>;
+  /**
+   * Change the public display setting. Does not touch the hash chain, signature, or updated_at.
+   */
+  setReceiptVisibility(input: SetReceiptVisibilityInput): Promise<SetReceiptVisibilityResult>;
   /** Read a confirm link without changing it. GET must not confirm. */
   readConfirmation(token: string): Promise<ReadConfirmationResult>;
   /** Record Confirm or Decline once. Expired and used tokens are refused. */
