@@ -118,6 +118,12 @@ test("create, attach, and verify a purchase receipt", async () => {
     assert.equal(page.statusCode, 200, page.body);
     assert.match(String(page.headers["content-type"]), /text\/html/);
     assert.match(page.body, /class="badge ok">Verified</);
+    assert.match(page.body, /Approver \(reported by agent\): Ada Lovelace/);
+    assert.match(
+      page.body,
+      /Verified = this record hasn't been changed since it was created\. It doesn't confirm who approved\./,
+    );
+    assert.doesNotMatch(page.body, /human verified|human confirmed|proof they approved|human's approval|human who approved/i);
     assert.match(page.body, /Ada Lovelace/);
     assert.match(page.body, /Two bags of coffee, delivery this week/);
     assert.match(page.body, /North Market/);
@@ -164,6 +170,11 @@ test("create, attach, and verify a purchase receipt", async () => {
     assert.equal((again.json() as VerifyBody).valid, true);
     const deliveredPage = await app.inject({ method: "GET", url: `/r/${receipt.receipt_id}` });
     assert.match(deliveredPage.body, /class="badge ok">Verified</);
+    assert.match(deliveredPage.body, /Approver \(reported by agent\): Ada Lovelace/);
+    assert.match(
+      deliveredPage.body,
+      /Verified = this record hasn't been changed since it was created\. It doesn't confirm who approved\./,
+    );
     assert.match(deliveredPage.body, /ord_123/);
     assert.match(deliveredPage.body, /order_confirmation/);
   } finally {
@@ -179,8 +190,15 @@ test("MCP receipt tools record, attach, and verify without an API key", async ()
     const attach = listed.result?.tools?.find((tool) => tool.name === "attach_proof");
     const verify = listed.result?.tools?.find((tool) => tool.name === "verify_receipt");
     assert.match(record?.description ?? "", /does not hold or move the money/i);
+    assert.match(record?.description ?? "", /reported as approved/i);
+    assert.match(record?.description ?? "", /does not confirm who approved/i);
+    assert.doesNotMatch(JSON.stringify(record), /human who approved|human's approval|human verified|human confirmed|proof they approved/i);
     assert.match(attach?.description ?? "", /edit_token/i);
     assert.match(verify?.description ?? "", /valid is true/i);
+    assert.match(verify?.description ?? "", /does not confirm who approved/i);
+    const getReceipt = listed.result?.tools?.find((tool) => tool.name === "get_receipt");
+    assert.match(getReceipt?.description ?? "", /reported as approved/i);
+    assert.doesNotMatch(JSON.stringify(getReceipt), /human who approved|human's approval|human verified|human confirmed/i);
 
     const created = toolJson(
       await rpc(app, "tools/call", {
@@ -367,6 +385,9 @@ test("editing a receipt row breaks verification", async () => {
     const page = await again.inject({ method: "GET", url: `/r/${receiptId}` });
     assert.match(page.body, /class="badge bad">Tampered</);
     assert.doesNotMatch(page.body, /class="badge ok"/);
+    assert.match(page.body, /Approver \(reported by agent\): Ada Lovelace/);
+    assert.match(page.body, /The stored receipt does not match its hash chain or server signature\./);
+    assert.doesNotMatch(page.body, /Verified = this record hasn't been changed/);
     assert.match(page.body, /tampered scope/);
     assert.equal(page.body.includes(CONTACT), false);
     const proof = await again.inject({

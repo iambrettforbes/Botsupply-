@@ -3,7 +3,7 @@
 [![iambrettforbes/Botsupply- MCP server](https://glama.ai/mcp/servers/iambrettforbes/Botsupply-/badges/score.svg)](https://glama.ai/mcp/servers/iambrettforbes/Botsupply-)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Free, rail-agnostic purchase receipts for AI agents.** Record a human's approval for a purchase on any payment rail, attach proof of delivery, and get a public, verifiable receipt URL. Receipts do not hold or move the money, and they need no wallet.
+**Free, rail-agnostic purchase receipts for AI agents.** Store a record of what was reported as approved for a purchase on any payment rail, attach proof of delivery, and get a public receipt URL. Verified means the record hasn't changed since it was created; it doesn't confirm who approved. Receipts do not hold or move the money, and they need no wallet.
 
 Also included (optional): prepaid credit wallets, agent-to-agent job escrow, and a small wholesale catalog.
 
@@ -33,12 +33,12 @@ Install notes and auth: [MCP_INSTALL.md](MCP_INSTALL.md). REST agents: [AGENT_IN
 
 | Tool | What it does |
 | --- | --- |
-| `record_approval` | Record a human's approval of a purchase on any rail. Returns `receipt_id`, public `receipt_url`, and a one-time `edit_token`. |
+| `record_approval` | Write a record of what was reported as approved for a purchase on any rail. The approver is a name the agent supplies. Returns `receipt_id`, public `receipt_url`, and a one-time `edit_token`. |
 | `attach_proof` | Attach delivery proof with the `edit_token` (order confirmation, tracking, URL, hash, …). |
 | `get_receipt` | Public receipt JSON. |
-| `verify_receipt` | Recompute the hash chain and HMAC; returns `valid` true/false. |
+| `verify_receipt` | Recompute the hash chain and HMAC; returns `valid` true/false. `valid` means the record hasn't changed. It doesn't confirm who approved. |
 
-Public HTML page: `GET /r/:id` (Verified or Tampered badge).
+Public HTML page: `GET /r/:id` (Verified or Tampered badge). Verified means the record hasn't changed since it was created. It doesn't confirm who approved. The approver is shown as reported by the agent.
 
 ### Wallets and catalog
 
@@ -61,7 +61,7 @@ Public HTML page: `GET /r/:id` (Verified or Tampered badge).
 
 ## Purchase receipts
 
-An agent records a human's approval of a purchase on any payment rail (`stripe_link`, `card`, `x402`, `botsupply_wallet`, …) and later attaches proof of delivery. BotSupply stores the receipt and a public URL. **It does not hold or move the money.** No wallet and no API key are required.
+An agent records what was reported as approved for a purchase on any payment rail (`stripe_link`, `card`, `x402`, `botsupply_wallet`, …) and later attaches proof of delivery. The approver is a name the agent typed in. BotSupply stores that record and a public URL. **It does not hold or move the money, and it does not confirm who approved.** No wallet and no API key are required.
 
 ```bash
 curl -s -X POST https://botsupply.onrender.com/v1/receipts \
@@ -79,7 +79,7 @@ curl -s -X POST https://botsupply.onrender.com/v1/receipts/$RECEIPT_ID/proof \
 
 - `GET /v1/receipts/:id` — public JSON  
 - `GET /v1/receipts/:id/verify` — hash chain + HMAC check  
-- `GET /r/:id` — HTML with Verified / Tampered badge  
+- `GET /r/:id` — HTML with Verified / Tampered badge. Verified means the record hasn't changed since it was created and doesn't confirm who approved. The approver is labeled as reported by the agent.
 
 Approvals are rate-limited (30/min/IP). Optional `approver_contact` is stored only as a SHA-256 hash and is never returned. Each change is hash-chained (SHA-256). The latest hash is signed with HMAC-SHA256 using `RECEIPT_SIGNING_KEY`. Set that to a long random secret in production; if unset, an ephemeral key is generated and signatures will not verify after a restart. Changing the key makes older receipts verify as tampered.
 
@@ -141,7 +141,7 @@ The hosted service uses Postgres and reports `"storage":"postgres","mode":"test"
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| `POST` | `/v1/receipts` | Record approval (no auth) |
+| `POST` | `/v1/receipts` | Record what was reported as approved (no auth) |
 | `POST` | `/v1/receipts/:id/proof` | Attach proof (`edit_token`) |
 | `GET` | `/v1/receipts/:id` | Public JSON |
 | `GET` | `/v1/receipts/:id/verify` | Integrity check |

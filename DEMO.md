@@ -161,7 +161,7 @@ Errors are `{ "error": { "code": "…", "message": "…" } }`.
 
 ## 8. Purchase receipts
 
-Any agent can record a human's approval and later attach proof. BotSupply does not hold or move the money. No API key. The edit token is returned once. `approver_contact` is hashed and is not shown again. The public page is `/r/:id`.
+Any agent can record what was reported as approved and later attach proof. The approver is a name the agent supplies; it is not confirmation of who approved. BotSupply does not hold or move the money. No API key. The edit token is returned once. `approver_contact` is hashed and is not shown again. The public page is `/r/:id`. Verified means the record hasn't changed since it was created. It doesn't confirm who approved.
 
 ```bash
 curl -s -X POST "$BASE/v1/receipts" \
@@ -169,4 +169,4 @@ curl -s -X POST "$BASE/v1/receipts" \
   -d '{"approver":"Ada","merchant_name":"North Market","scope":"Two bags of coffee","price_cap_amount":"25.00","price_cap_currency":"USD","payment_rail":"stripe_link"}'
 ```
 
-`GET /v1/receipts/:id/verify` returns `valid` true when the hash chain and HMAC signature match. Set `RECEIPT_SIGNING_KEY` on the service so signatures survive a restart. Approval calls are limited to 30 per minute per IP.
+`GET /v1/receipts/:id/verify` returns `valid` true when the hash chain and HMAC signature match. `valid` means the record hasn't changed since it was created. It doesn't confirm who approved. Set `RECEIPT_SIGNING_KEY` on the service so signatures survive a restart. Approval calls are limited to 30 per minute per IP.
