@@ -40,10 +40,49 @@ function proofBlock(receipt: PublicReceipt): string {
     .join("\n");
 }
 
+function timelineLabel(kind: PublicReceipt["timeline"][number]["kind"]): string {
+  switch (kind) {
+    case "approved":
+      return "Reported as approved";
+    case "proof_attached":
+      return "Proof attached";
+    case "approver_confirmed":
+      return "Approver confirmed";
+    case "approver_declined":
+      return "Approver declined";
+  }
+}
+
+function confirmationBlock(receipt: PublicReceipt): string {
+  const confirmation = receipt.approver_confirmation;
+  if (confirmation.status === "confirmed") {
+    const when = confirmation.at ?? "";
+    const channel = confirmation.channel ?? "";
+    const contact = confirmation.contact_masked ? ` (${confirmation.contact_masked})` : "";
+    return `<div class="confirm-state is-confirmed">
+      <strong>Approver confirmed ✓</strong>
+      <p>Time ${esc(when)}. Channel ${esc(channel)}${esc(contact)}. This means the person who opened the one-time link for that contact clicked Confirm.</p>
+    </div>`;
+  }
+  if (confirmation.status === "declined") {
+    const when = confirmation.at ?? "";
+    const channel = confirmation.channel ?? "";
+    const contact = confirmation.contact_masked ? ` (${confirmation.contact_masked})` : "";
+    return `<div class="confirm-state is-declined">
+      <strong>Approver declined</strong>
+      <p>Time ${esc(when)}. Channel ${esc(channel)}${esc(contact)}. This means the person who opened the one-time link for that contact clicked Decline.</p>
+    </div>`;
+  }
+  return `<div class="confirm-state is-unconfirmed">
+    <strong>Approver unconfirmed</strong>
+    <p>No one has confirmed this receipt through a contact link. The name above was reported by the agent.</p>
+  </div>`;
+}
+
 function timelineBlock(receipt: PublicReceipt): string {
   return receipt.timeline
     .map((entry) => {
-      const label = entry.kind === "approved" ? "Reported as approved" : "Proof attached";
+      const label = timelineLabel(entry.kind);
       return `<li>
         <div class="row"><dt>${esc(label)}</dt><dd>${esc(entry.at)}</dd></div>
         <p class="hash">prev ${esc(entry.prev_hash || "—")}</p>
@@ -121,6 +160,14 @@ export function renderReceiptPage(receipt: PublicReceipt, verification: VerifyRe
     .explain { color: var(--muted); margin: 18px 0 0; max-width: 62ch; }
     .note { color: var(--muted); margin: 18px 0 0; }
     .explain + .note { margin-top: 8px; }
+    .confirm-state { margin-top: 16px; padding: 12px 14px; border: 1px solid var(--line); background: var(--bg-2); }
+    .confirm-state strong { display: block; letter-spacing: 0.06em; text-transform: uppercase; font-size: 13px; }
+    .confirm-state p { margin: 6px 0 0; color: var(--muted); }
+    .confirm-state.is-unconfirmed strong { color: var(--muted); }
+    .confirm-state.is-confirmed { border-color: var(--stamp); }
+    .confirm-state.is-confirmed strong { color: var(--stamp); }
+    .confirm-state.is-declined { border-color: var(--danger); }
+    .confirm-state.is-declined strong { color: var(--danger); }
     section { margin-top: 28px; padding-top: 16px; border-top: 1px solid var(--line); }
     h2 { margin: 0 0 12px; font-size: 12px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
     .lead { margin: 0 0 8px; font-size: 18px; }
@@ -162,6 +209,7 @@ export function renderReceiptPage(receipt: PublicReceipt, verification: VerifyRe
     </header>
     ${verifiedMeaning}
     <p class="note">${esc(note)} BotSupply did not hold or move the money. Rail: ${esc(receipt.payment_rail)}.</p>
+    ${confirmationBlock(receipt)}
     <section>
       <h2>Reported approval</h2>
       ${row("Approver (reported by agent)", receipt.approver)}

@@ -119,6 +119,8 @@ test("create, attach, and verify a purchase receipt", async () => {
     assert.match(String(page.headers["content-type"]), /text\/html/);
     assert.match(page.body, /class="badge ok">Verified</);
     assert.match(page.body, /Approver \(reported by agent\): Ada Lovelace/);
+    assert.match(page.body, /Approver unconfirmed/);
+    assert.doesNotMatch(page.body, /Approver confirmed ✓/);
     assert.match(
       page.body,
       /Verified = this record hasn't been changed since it was created\. It doesn't confirm who approved\./,
@@ -192,12 +194,16 @@ test("MCP receipt tools record, attach, and verify without an API key", async ()
     assert.match(record?.description ?? "", /does not hold or move the money/i);
     assert.match(record?.description ?? "", /reported as approved/i);
     assert.match(record?.description ?? "", /does not confirm who approved/i);
+    assert.match(record?.description ?? "", /confirm_url/i);
+    assert.match(record?.description ?? "", /unconfirmed/i);
     assert.doesNotMatch(JSON.stringify(record), /human who approved|human's approval|human verified|human confirmed|proof they approved/i);
     assert.match(attach?.description ?? "", /edit_token/i);
     assert.match(verify?.description ?? "", /valid is true/i);
     assert.match(verify?.description ?? "", /does not confirm who approved/i);
     const getReceipt = listed.result?.tools?.find((tool) => tool.name === "get_receipt");
     assert.match(getReceipt?.description ?? "", /reported as approved/i);
+    assert.match(getReceipt?.description ?? "", /approver_confirmation/i);
+    assert.match(getReceipt?.description ?? "", /unconfirmed/i);
     assert.doesNotMatch(JSON.stringify(getReceipt), /human who approved|human's approval|human verified|human confirmed/i);
 
     const created = toolJson(
@@ -386,6 +392,8 @@ test("editing a receipt row breaks verification", async () => {
     assert.match(page.body, /class="badge bad">Tampered</);
     assert.doesNotMatch(page.body, /class="badge ok"/);
     assert.match(page.body, /Approver \(reported by agent\): Ada Lovelace/);
+    assert.match(page.body, /Approver unconfirmed/);
+    assert.doesNotMatch(page.body, /Approver confirmed ✓/);
     assert.match(page.body, /The stored receipt does not match its hash chain or server signature\./);
     assert.doesNotMatch(page.body, /Verified = this record hasn't been changed/);
     assert.match(page.body, /tampered scope/);

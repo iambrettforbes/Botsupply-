@@ -161,7 +161,7 @@ Errors are `{ "error": { "code": "…", "message": "…" } }`.
 
 ## 8. Purchase receipts
 
-Any agent can record what was reported as approved and later attach proof. The approver is a name the agent supplies; it is not confirmation of who approved. BotSupply does not hold or move the money. No API key. The edit token is returned once. `approver_contact` is hashed and is not shown again. The public page is `/r/:id`. Verified means the record hasn't changed since it was created. It doesn't confirm who approved.
+Any agent can record what was reported as approved and later attach proof. The approver name is supplied by the agent; that name is not confirmation of who approved. BotSupply does not hold or move the money. No API key. The edit token is returned once. An email `approver_contact` also returns `confirm_url` once when no email provider is configured; the caller delivers it. The address is hashed and is not shown again. The receipt stays Approver unconfirmed until that person clicks Confirm on `/c/:token`. The public page is `/r/:id`. Verified means the record hasn't changed since it was created. It doesn't confirm who approved.
 
 ```bash
 curl -s -X POST "$BASE/v1/receipts" \

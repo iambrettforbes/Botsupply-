@@ -17,7 +17,29 @@ export const RECEIPT_REF_MAX = 200;
 export const RECEIPT_PROOF_TYPE_MAX = 64;
 export const RECEIPT_PROOF_VALUE_MAX = 2_000;
 
+/** Confirm-link attempts accepted per IP per window. The token is unguessable; this slows guessing. */
+export const CONFIRM_RATE_LIMIT_MAX = 30;
+export const CONFIRM_RATE_WINDOW_MS = 60_000;
+
+/** Default life of a confirm link: 24 hours. `RECEIPT_CONFIRM_TTL_SECONDS` overrides it. */
+export const CONFIRM_TTL_MS_DEFAULT = 24 * 60 * 60 * 1000;
+
+const CONFIRM_TTL_MS_MAX = 30 * 24 * 60 * 60 * 1000;
+
 export type ReceiptStatus = "approved" | "delivered" | "disputed";
+
+export type ReceiptEventKind = "approved" | "proof_attached" | "approver_confirmed" | "approver_declined";
+
+/** `sms` is reserved so a later sender can use the same confirm link. Only `email` is accepted today. */
+export type ContactChannel = "email" | "sms";
+
+export type ApproverDecision = "confirmed" | "declined";
+
+export type ConfirmContact = {
+  channel: "email";
+  address: string;
+  masked: string;
+};
 
 export type ReceiptProof = {
   id: string;
@@ -32,7 +54,7 @@ export type ReceiptProof = {
 export type ReceiptEvent = {
   id: string;
   seq: number;
-  kind: "approved" | "proof_attached";
+  kind: ReceiptEventKind;
   prev_hash: string;
   hash: string;
   payload_json: string;
@@ -60,6 +82,11 @@ export type ReceiptRecord = {
   content_hash: string;
   signature: string;
   edit_token_hash: string;
+  /** Null until the approver clicks Confirm or Decline. Omitted from the hash snapshot while null. */
+  approver_decision: ApproverDecision | null;
+  approver_decision_at: string | null;
+  approver_decision_channel: ContactChannel | null;
+  approver_contact_masked: string | null;
   proofs: ReceiptProof[];
   events: ReceiptEvent[];
 };
@@ -74,10 +101,22 @@ export type PublicProof = {
 
 export type PublicTimelineEntry = {
   seq: number;
-  kind: "approved" | "proof_attached";
+  kind: ReceiptEventKind;
   at: string;
   prev_hash: string;
   hash: string;
+};
+
+/**
+ * Public confirmation state.
+ * `confirmed` means the person who opened the one-time link for that contact clicked Confirm.
+ * `unconfirmed` is the default, including receipts created before confirm links existed.
+ */
+export type PublicApproverConfirmation = {
+  status: "unconfirmed" | ApproverDecision;
+  at: string | null;
+  channel: ContactChannel | null;
+  contact_masked: string | null;
 };
 
 /** JSON returned by the public receipt routes. No contact and no edit token. */
@@ -99,6 +138,7 @@ export type PublicReceipt = {
   proofs: PublicProof[];
   content_hash: string;
   timeline: PublicTimelineEntry[];
+  approver_confirmation: PublicApproverConfirmation;
 };
 
 export type CreateReceiptInput = {
@@ -113,6 +153,9 @@ export type CreateReceiptInput = {
   priceCapCurrency: string;
   paymentRail: string;
   externalPaymentRef: string | null;
+  /** Set only when the contact is an email and a confirm link should be issued. */
+  confirmContact: ConfirmContact | null;
+  confirmationWebhookUrl: string | null;
 };
 
 export type AttachProofInput = {
@@ -136,6 +179,7 @@ export type VerifyResult = {
   receipt_id: string;
   content_hash: string;
   checks: VerifyChecks;
+  approver_confirmation: PublicApproverConfirmation;
 };
 
 type SnapshotProof = {
@@ -168,11 +212,21 @@ export type ReceiptSnapshot = {
   external_payment_ref: string | null;
   status: ReceiptStatus;
   proofs: SnapshotProof[];
+  /**
+   * Present only after Confirm or Decline.
+   * Left off while unset so receipts signed before this field existed still match.
+   */
+  approver_confirmation?: {
+    status: ApproverDecision;
+    at: string;
+    channel: ContactChannel;
+    contact_masked: string;
+  };
 };
 
 type ChainEventBody = {
   seq: number;
-  kind: "approved" | "proof_attached";
+  kind: ReceiptEventKind;
   prev_hash: string;
   snapshot: ReceiptSnapshot;
 };
@@ -226,6 +280,120 @@ export function resolveReceiptSigningKey(override?: string): Buffer {
 
 export function hashApproverContact(contact: string): string {
   return crypto.createHash("sha256").update(contact.trim().toLowerCase()).digest("hex");
+}
+
+export function hashConfirmToken(token: string): string {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+export function newConfirmToken(): string {
+  return `cftok_${crypto.randomBytes(32).toString("hex")}`;
+}
+
+export function isConfirmToken(token: string): boolean {
+  return /^cftok_[0-9a-f]{64}$/.test(token);
+}
+
+/** Hide the local part. `ada.secret@example.com` becomes `a***@example.com`. */
+export function maskEmail(email: string): string {
+  const at = email.indexOf("@");
+  const local = at >= 0 ? email.slice(0, at) : email;
+  const domain = at >= 0 ? email.slice(at + 1) : "";
+  const first = local.slice(0, 1) || "*";
+  return domain ? `${first}***@${domain}` : `${first}***`;
+}
+
+const EMAIL_RE = /^[a-z0-9._%+-]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+
+export function normalizeEmail(raw: string): string | undefined {
+  const text = raw.trim().toLowerCase();
+  if (text.length === 0 || text.length > RECEIPT_CONTACT_MAX) return undefined;
+  if (!EMAIL_RE.test(text)) return undefined;
+  return text;
+}
+
+export function readConfirmTtlMs(raw: string | undefined, override?: number): number {
+  if (override !== undefined) return validateConfirmTtl(override);
+  const text = raw?.trim() ?? "";
+  if (text.length === 0) return CONFIRM_TTL_MS_DEFAULT;
+  if (!/^\d+$/.test(text)) throw new Error("RECEIPT_CONFIRM_TTL_SECONDS must be an integer number of seconds");
+  const seconds = Number(text);
+  if (!Number.isSafeInteger(seconds)) throw new Error("RECEIPT_CONFIRM_TTL_SECONDS is out of range");
+  return validateConfirmTtl(seconds * 1000);
+}
+
+function validateConfirmTtl(ms: number): number {
+  if (!Number.isInteger(ms) || ms < 0 || ms > CONFIRM_TTL_MS_MAX) {
+    throw new Error("confirm TTL must be an integer from 0 to 30 days");
+  }
+  return ms;
+}
+
+export function confirmExpiresAt(createdAt: string, ttlMs: number): string {
+  const start = Date.parse(createdAt);
+  if (!Number.isFinite(start)) throw new Error("confirm token created_at is not a time");
+  return new Date(start + ttlMs).toISOString();
+}
+
+export function confirmTokenState(expiresAt: string, usedAt: string | null, now: string): "open" | "used" | "expired" {
+  if (usedAt) return "used";
+  if (expiresAt <= now) return "expired";
+  return "open";
+}
+
+/** Drop the confirm token from request logs. The path is the secret. */
+export function redactConfirmToken(url: string): string {
+  return url.replace(/\/c\/[^/?#\s]+/g, "/c/[redacted]");
+}
+
+function isPrivateIp(host: string): boolean {
+  const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
+  if (bare === "::1" || bare === "0.0.0.0") return true;
+  const mapped = bare.startsWith("::ffff:") ? bare.slice("::ffff:".length) : bare;
+  const parts = mapped.split(".");
+  if (parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part))) {
+    const nums = parts.map((part) => Number(part));
+    if (nums.some((num) => num > 255)) return false;
+    const a = nums[0] ?? 0;
+    const b = nums[1] ?? 0;
+    if (a === 10 || a === 127 || a === 0) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    return false;
+  }
+  if (bare.includes(":")) {
+    if (bare.startsWith("fc") || bare.startsWith("fd")) return true;
+    if (bare.startsWith("fe8") || bare.startsWith("fe9") || bare.startsWith("fea") || bare.startsWith("feb")) return true;
+  }
+  return false;
+}
+
+export function isBlockedWebhookHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  if (host.length === 0) return true;
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) {
+    return true;
+  }
+  if (host === "metadata.google.internal" || host === "metadata.google.com") return true;
+  return isPrivateIp(host);
+}
+
+/** https only, no private hosts, no credentials. Returns the canonical URL or undefined. */
+export function canonicalizeWebhookUrl(raw: string): string | undefined {
+  const text = raw.trim();
+  if (text.length === 0 || text.length > RECEIPT_URL_MAX) return undefined;
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "https:") return undefined;
+  if (url.username || url.password) return undefined;
+  if (isBlockedWebhookHost(url.hostname)) return undefined;
+  return url.toString();
 }
 
 export function hashEditToken(token: string): string {
@@ -383,7 +551,7 @@ function newHexId(prefix: string, bytes: number): string {
 }
 
 export function receiptSnapshot(record: ReceiptRecord): ReceiptSnapshot {
-  return {
+  const snapshot: ReceiptSnapshot = {
     receipt_id: record.id,
     mode: record.mode,
     created_at: record.created_at,
@@ -411,6 +579,20 @@ export function receiptSnapshot(record: ReceiptRecord): ReceiptSnapshot {
       attached_at: proof.attached_at,
     })),
   };
+  if (
+    record.approver_decision &&
+    record.approver_decision_at &&
+    record.approver_decision_channel &&
+    record.approver_contact_masked
+  ) {
+    snapshot.approver_confirmation = {
+      status: record.approver_decision,
+      at: record.approver_decision_at,
+      channel: record.approver_decision_channel,
+      contact_masked: record.approver_contact_masked,
+    };
+  }
+  return snapshot;
 }
 
 function seal(body: ChainEventBody, key: Buffer, createdAt: string): { event: ReceiptEvent; hash: string; signature: string } {
@@ -450,6 +632,10 @@ export function planApproval(input: CreateReceiptInput, mode: StripeMode, now: s
     content_hash: "",
     signature: "",
     edit_token_hash: hashEditToken(editToken),
+    approver_decision: null,
+    approver_decision_at: null,
+    approver_decision_channel: null,
+    approver_contact_masked: null,
     proofs: [],
     events: [],
   };
@@ -527,6 +713,77 @@ export function planProof(record: ReceiptRecord, input: AttachProofInput, now: s
   };
 }
 
+export type PlanDecisionResult =
+  | {
+      ok: true;
+      event: ReceiptEvent;
+      decision: ApproverDecision;
+      contentHash: string;
+      signature: string;
+      updatedAt: string;
+      channel: ContactChannel;
+      contactMasked: string;
+    }
+  | { ok: false; code: "tampered" | "already_decided" };
+
+/**
+ * Append a confirm or decline event.
+ * Refuses a tampered row so a broken receipt cannot be re-signed, and refuses a second decision.
+ */
+export function planApproverDecision(
+  record: ReceiptRecord,
+  input: { decision: "confirm" | "decline"; channel: ContactChannel; contactMasked: string },
+  now: string,
+  key: Buffer,
+): PlanDecisionResult {
+  if (record.approver_decision) return { ok: false, code: "already_decided" };
+  if (!input.contactMasked) return { ok: false, code: "tampered" };
+  if (!verifyReceiptRecord(record, key).valid) return { ok: false, code: "tampered" };
+  const previous = record.events[record.events.length - 1];
+  if (!previous) return { ok: false, code: "tampered" };
+  const decision: ApproverDecision = input.decision === "confirm" ? "confirmed" : "declined";
+  const updated: ReceiptRecord = {
+    ...record,
+    updated_at: now,
+    approver_decision: decision,
+    approver_decision_at: now,
+    approver_decision_channel: input.channel,
+    approver_contact_masked: input.contactMasked,
+  };
+  const sealed = seal(
+    {
+      seq: record.events.length,
+      kind: decision === "confirmed" ? "approver_confirmed" : "approver_declined",
+      prev_hash: previous.hash,
+      snapshot: receiptSnapshot(updated),
+    },
+    key,
+    now,
+  );
+  return {
+    ok: true,
+    event: sealed.event,
+    decision,
+    contentHash: sealed.hash,
+    signature: sealed.signature,
+    updatedAt: now,
+    channel: input.channel,
+    contactMasked: input.contactMasked,
+  };
+}
+
+export function publicApproverConfirmation(record: ReceiptRecord): PublicApproverConfirmation {
+  if (!record.approver_decision) {
+    return { status: "unconfirmed", at: null, channel: null, contact_masked: null };
+  }
+  return {
+    status: record.approver_decision,
+    at: record.approver_decision_at,
+    channel: record.approver_decision_channel,
+    contact_masked: record.approver_contact_masked,
+  };
+}
+
 export function verifyReceiptRecord(record: ReceiptRecord, key: Buffer): VerifyResult {
   const checks: VerifyChecks = { chain: false, content: false, signature: false };
   const failed = (): VerifyResult => ({
@@ -534,6 +791,7 @@ export function verifyReceiptRecord(record: ReceiptRecord, key: Buffer): VerifyR
     receipt_id: record.id,
     content_hash: record.content_hash,
     checks,
+    approver_confirmation: publicApproverConfirmation(record),
   });
   if (record.events.length === 0) return failed();
   let previous = "";
@@ -566,6 +824,7 @@ export function verifyReceiptRecord(record: ReceiptRecord, key: Buffer): VerifyR
     receipt_id: record.id,
     content_hash: record.content_hash,
     checks,
+    approver_confirmation: publicApproverConfirmation(record),
   };
 }
 
@@ -606,6 +865,7 @@ export function toPublicReceipt(record: ReceiptRecord, receiptUrl: string): Publ
       prev_hash: event.prev_hash,
       hash: event.hash,
     })),
+    approver_confirmation: publicApproverConfirmation(record),
   };
 }
 
@@ -634,7 +894,7 @@ function requiredText(value: unknown, field: string, max: number): Parsed<string
 export function parseApprovalBody(body: Record<string, unknown>): Parsed<CreateReceiptInput> {
   const approver = requiredText(body.approver, "approver", RECEIPT_APPROVER_MAX);
   if (!approver.ok) return approver;
-  const contact = optionalText(body.approver_contact, "approver_contact", RECEIPT_CONTACT_MAX);
+  const contact = parseApproverContact(body.approver_contact);
   if (!contact.ok) return contact;
   const agentId = optionalText(body.agent_id, "agent_id", RECEIPT_AGENT_MAX);
   if (!agentId.ok) return agentId;
@@ -667,11 +927,25 @@ export function parseApprovalBody(body: Record<string, unknown>): Parsed<CreateR
   if (!rail.ok) return rail;
   const externalRef = optionalText(body.external_payment_ref, "external_payment_ref", RECEIPT_REF_MAX);
   if (!externalRef.ok) return externalRef;
+  let confirmationWebhookUrl: string | null = null;
+  if (body.confirmation_webhook_url != null) {
+    if (typeof body.confirmation_webhook_url !== "string") {
+      return { ok: false, message: "confirmation_webhook_url must be a public https URL" };
+    }
+    const webhook = canonicalizeWebhookUrl(body.confirmation_webhook_url);
+    if (!webhook) return { ok: false, message: "confirmation_webhook_url must be a public https URL" };
+    confirmationWebhookUrl = webhook;
+  }
+  if (confirmationWebhookUrl && !contact.value.confirm) {
+    return { ok: false, message: "confirmation_webhook_url requires an email approver_contact" };
+  }
   return {
     ok: true,
     value: {
       approverName: approver.value,
-      approverContactHash: contact.value == null ? null : hashApproverContact(contact.value),
+      approverContactHash: contact.value.hash,
+      confirmContact: contact.value.confirm,
+      confirmationWebhookUrl,
       agentId: agentId.value,
       agentName: agentName.value,
       merchantName: merchantName.value,
@@ -682,6 +956,42 @@ export function parseApprovalBody(body: Record<string, unknown>): Parsed<CreateR
       paymentRail: rail.value,
       externalPaymentRef: externalRef.value,
     },
+  };
+}
+
+function parseApproverContact(value: unknown): Parsed<{ hash: string | null; confirm: ConfirmContact | null }> {
+  if (value == null) return { ok: true, value: { hash: null, confirm: null } };
+  if (typeof value === "string") {
+    const parsed = optionalText(value, "approver_contact", RECEIPT_CONTACT_MAX);
+    if (!parsed.ok) return parsed;
+    if (parsed.value == null) return { ok: true, value: { hash: null, confirm: null } };
+    const email = normalizeEmail(parsed.value);
+    if (!email) return { ok: true, value: { hash: hashApproverContact(parsed.value), confirm: null } };
+    return {
+      ok: true,
+      value: { hash: hashApproverContact(email), confirm: { channel: "email", address: email, masked: maskEmail(email) } },
+    };
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return { ok: false, message: "approver_contact must be an email string or { channel, address }" };
+  }
+  const body = value as Record<string, unknown>;
+  const extra = Object.keys(body).filter((key) => key !== "channel" && key !== "address");
+  if (extra.length > 0) return { ok: false, message: "approver_contact allows channel and address" };
+  if (body.channel !== "email" && body.channel !== "sms") {
+    return { ok: false, message: "approver_contact.channel must be email or sms" };
+  }
+  if (body.channel === "sms") {
+    return { ok: false, message: "approver_contact channel sms is not available yet. Use email." };
+  }
+  if (typeof body.address !== "string") {
+    return { ok: false, message: "approver_contact.address must be an email address" };
+  }
+  const email = normalizeEmail(body.address);
+  if (!email) return { ok: false, message: "approver_contact.address must be an email address" };
+  return {
+    ok: true,
+    value: { hash: hashApproverContact(email), confirm: { channel: "email", address: email, masked: maskEmail(email) } },
   };
 }
 
@@ -726,9 +1036,21 @@ export function asReceiptStatus(value: string): ReceiptStatus {
   throw new Error(`Unexpected receipt status: ${value}`);
 }
 
-export function asEventKind(value: string): "approved" | "proof_attached" {
-  if (value === "approved" || value === "proof_attached") return value;
+export function asEventKind(value: string): ReceiptEventKind {
+  if (value === "approved" || value === "proof_attached" || value === "approver_confirmed" || value === "approver_declined") {
+    return value;
+  }
   throw new Error(`Unexpected receipt event kind: ${value}`);
+}
+
+export function asApproverDecision(value: string): ApproverDecision {
+  if (value === "confirmed" || value === "declined") return value;
+  throw new Error(`Unexpected approver decision: ${value}`);
+}
+
+export function asContactChannel(value: string): ContactChannel {
+  if (value === "email" || value === "sms") return value;
+  throw new Error(`Unexpected approver channel: ${value}`);
 }
 
 export function asStripeMode(value: string): StripeMode {
@@ -756,6 +1078,10 @@ export type ReceiptHeaderRow = {
   content_hash: string;
   signature: string;
   edit_token_hash: string;
+  approver_decision?: string | null;
+  approver_decision_at?: string | Date | null;
+  approver_decision_channel?: string | null;
+  approver_contact_masked?: string | null;
 };
 
 export type ReceiptProofRow = {
@@ -808,6 +1134,10 @@ export function assembleReceipt(header: ReceiptHeaderRow, proofs: ReceiptProofRo
     content_hash: header.content_hash,
     signature: header.signature,
     edit_token_hash: header.edit_token_hash,
+    approver_decision: header.approver_decision ? asApproverDecision(header.approver_decision) : null,
+    approver_decision_at: header.approver_decision_at ? iso(header.approver_decision_at) : null,
+    approver_decision_channel: header.approver_decision_channel ? asContactChannel(header.approver_decision_channel) : null,
+    approver_contact_masked: header.approver_contact_masked ?? null,
     proofs: proofs.map((proof) => ({
       id: proof.id,
       proof_index: Number(proof.proof_index),

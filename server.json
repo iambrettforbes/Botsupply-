@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.iambrettforbes/botsupply",
   "title": "BotSupply",
-  "description": "Tamper-evident purchase receipts for agents: a record of what was reported as approved, plus delivery proof. Verified means the record hasn't changed; it doesn't confirm who approved. Wallets and escrow (test mode).",
-  "version": "1.1.0",
+  "description": "Tamper-evident purchase receipts for agents. Record what was reported as approved, optionally let the approver contact confirm or decline through a one-time link, and attach delivery proof. Verified means the record hasn't changed. Approver confirmed means the person with access to that contact clicked Confirm. Wallets and escrow (test mode).",
+  "version": "1.2.0",
   "websiteUrl": "https://github.com/iambrettforbes/Botsupply-",
   "remotes": [
     {

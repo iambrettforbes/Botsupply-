@@ -26,7 +26,7 @@ const INSTRUCTIONS = [
   "Auth is a wallet API key: Authorization: Bearer on the MCP connection, or the api_key tool argument returned once by open_wallet.",
   "Credits are prepaid. create_checkout returns a Stripe Checkout URL when that route is configured. This server does not mint credits.",
   "create_job holds the caller's credits in escrow for another agent's wallet. release_job pays the payee when the work is delivered. refund_job returns the hold to the payer. The payer authorizes release and refund. The payee can also refund to cancel. A platform fee, ESCROW_FEE_BPS, defaults to 0 and is withheld from the payee only on release.",
-  "record_approval writes a public record of what was reported as approved for a payment on any rail. The approver name is supplied by the calling agent and is not confirmation of who approved. BotSupply does not hold or move that money. attach_proof adds delivery proof with the edit_token from record_approval. get_receipt and verify_receipt are public. verify_receipt checks that the record has not changed since it was created. It does not confirm who approved.",
+  "record_approval writes a public record of what was reported as approved for a payment on any rail. The approver name is supplied by the calling agent and is not confirmation of who approved. If approver_contact is an email, BotSupply issues a one-time expiring confirm link. When no email provider is configured, confirm_url is returned and nothing is sent. confirmed means the person who opened that link clicked Confirm. Unconfirmed is the default. BotSupply does not hold or move that money. attach_proof adds delivery proof with the edit_token from record_approval. get_receipt and verify_receipt are public and include approver_confirmation. verify_receipt checks that the record has not changed since it was created. It does not confirm who approved.",
 ].join(" ");
 
 export type ApiResult = {
@@ -137,7 +137,8 @@ const jobIdSchema = fromJsonSchema<{ job_id: string; api_key?: string }>({
 
 const recordApprovalSchema = fromJsonSchema<{
   approver: string;
-  approver_contact?: string;
+  approver_contact?: string | { channel: "email" | "sms"; address: string };
+  confirmation_webhook_url?: string;
   agent_id?: string;
   agent_name?: string;
   merchant_name: string;
@@ -156,9 +157,25 @@ const recordApprovalSchema = fromJsonSchema<{
       description: "Name the calling agent reports as the approver. Not confirmation that this person approved.",
     },
     approver_contact: {
+      description:
+        "Optional email string, or { channel: \"email\", address }. An email issues a one-time confirm link. The address is stored only as a hash. sms is reserved and rejected until a sender exists. A non-email string is stored as a hash only and does not issue a link.",
+      anyOf: [
+        { type: "string", maxLength: RECEIPT_CONTACT_MAX },
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["channel", "address"],
+          properties: {
+            channel: { type: "string", enum: ["email", "sms"], description: "email today. sms is reserved." },
+            address: { type: "string", maxLength: RECEIPT_CONTACT_MAX },
+          },
+        },
+      ],
+    },
+    confirmation_webhook_url: {
       type: "string",
-      maxLength: RECEIPT_CONTACT_MAX,
-      description: "Optional email or phone. Stored only as a hash and never shown on the receipt.",
+      description:
+        "Optional public https URL. After the contact clicks Confirm or Decline, BotSupply POSTs { receipt_id, approver_confirmation }. Best-effort. Poll get_receipt if it does not arrive. Requires an email approver_contact.",
     },
     agent_id: {
       type: "string",
@@ -508,7 +525,7 @@ function registerTools(server: McpServer, client: BotSupplyClient, defaultApiKey
     {
       title: "Record reported approval",
       description:
-        "Write a record of what was reported as approved for a purchase on any payment rail. The approver is a name supplied by the calling agent; this does not confirm who approved. BotSupply does not hold or move the money. Returns receipt_id, a public receipt_url, and an edit_token shown once. No wallet or API key. Rate limited per IP. Same as POST /v1/receipts.",
+        "Write a record of what was reported as approved for a purchase on any payment rail. The approver is a name supplied by the calling agent; this does not confirm who approved. BotSupply does not hold or move the money. Returns receipt_id, a public receipt_url, and an edit_token shown once. If approver_contact is an email, also issues a single-use expiring confirm link. When no email provider is configured, the response includes confirm_url and nothing is sent; the caller delivers that link. A click is a signed hash-chain event. approver_confirmation.status stays unconfirmed until the person with access to that contact clicks Confirm or Decline. confirmed means that person clicked Confirm. It is not a legal-identity check, and an unconfirmed receipt is not a verification of the person. No wallet or API key. Rate limited per IP. Same as POST /v1/receipts.",
       inputSchema: recordApprovalSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
@@ -522,6 +539,7 @@ function registerTools(server: McpServer, client: BotSupplyClient, defaultApiKey
         payment_rail: args.payment_rail,
       };
       if (args.approver_contact !== undefined) body.approver_contact = args.approver_contact;
+      if (args.confirmation_webhook_url !== undefined) body.confirmation_webhook_url = args.confirmation_webhook_url;
       if (args.agent_id !== undefined) body.agent_id = args.agent_id;
       if (args.agent_name !== undefined) body.agent_name = args.agent_name;
       if (args.merchant_url !== undefined) body.merchant_url = args.merchant_url;
@@ -556,7 +574,7 @@ function registerTools(server: McpServer, client: BotSupplyClient, defaultApiKey
     {
       title: "Get purchase receipt",
       description:
-        "Read a public purchase receipt: what was reported as approved, scope, price cap, merchant, proofs, and content hash. The approver is a name the calling agent reported, not confirmation of who approved. No API key. The approver contact and the edit token are not included. Same as GET /v1/receipts/:id.",
+        "Read a public purchase receipt: what was reported as approved, scope, price cap, merchant, proofs, content hash, and approver_confirmation. status is unconfirmed, confirmed, or declined. confirmed means the person with access to the contact clicked Confirm, with time and channel. unconfirmed is the default and is not a verification of the person. The approver name is what the calling agent reported. No API key. The raw contact, confirm link, and edit token are not included. Poll this to learn the click result. Same as GET /v1/receipts/:id.",
       inputSchema: receiptIdSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
@@ -568,7 +586,7 @@ function registerTools(server: McpServer, client: BotSupplyClient, defaultApiKey
     {
       title: "Verify purchase receipt",
       description:
-        "Recompute the receipt hash chain and HMAC signature. valid is true when the stored receipt matches the chain and the server signature, so the record hasn't been changed since it was created. valid does not confirm who approved. valid is false when a row was altered. Same as GET /v1/receipts/:id/verify.",
+        "Recompute the receipt hash chain and HMAC signature. valid is true when the stored receipt matches the chain and the server signature, so the record hasn't been changed since it was created. valid does not confirm who approved. The result also includes approver_confirmation: unconfirmed, confirmed, or declined. confirmed means the person with access to the contact clicked Confirm. valid is false when a row was altered. Same as GET /v1/receipts/:id/verify.",
       inputSchema: receiptIdSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
